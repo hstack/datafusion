@@ -718,6 +718,7 @@ fn roundtrip_parquet_exec_with_pruning_predicate() -> Result<()> {
             ]))),
         },
         projection: None,
+        projection_deep: None, 
         limit: None,
         table_partition_cols: vec![],
         output_ordering: vec![],
@@ -749,6 +750,7 @@ async fn roundtrip_parquet_exec_with_table_partition_cols() -> Result<()> {
         statistics: Statistics::new_unknown(&schema),
         file_schema: schema,
         projection: Some(vec![0, 1]),
+        projection_deep: None,
         limit: None,
         table_partition_cols: vec![Field::new(
             "part".to_string(),
@@ -782,6 +784,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
             ]))),
         },
         projection: None,
+        projection_deep: None,
         limit: None,
         table_partition_cols: vec![],
         output_ordering: vec![],
