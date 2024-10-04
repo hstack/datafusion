@@ -1559,7 +1559,6 @@ mod tests {
     use hashbrown::raw::RawTable;
     use rstest::*;
     use rstest_reuse::*;
-    use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
     fn div_ceil(a: usize, b: usize) -> usize {
         (a + b - 1) / b
