@@ -1,112 +1,11 @@
-use crate::datasource::schema_adapter::{SchemaAdapter, SchemaMapper};
+//! TODO: module doc
+
+use crate::datasource::schema_adapter::SchemaMapper;
 use arrow_array::RecordBatch;
-use arrow_schema::{Fields, Schema, SchemaRef};
-use datafusion_common::deep::{can_rewrite_field, try_rewrite_record_batch, try_rewrite_record_batch_with_mappings};
-use datafusion_common::plan_err;
-use std::sync::Arc;
-use log::trace;
+use arrow_schema::SchemaRef;
+use datafusion_common::deep::{try_rewrite_record_batch, try_rewrite_record_batch_with_mappings};
 
-#[derive(Clone, Debug)]
-pub(crate) struct NestedSchemaAdapter {
-    /// The schema for the table, projected to include only the fields being output (projected) by the
-    /// associated ParquetExec
-    pub projected_table_schema: SchemaRef,
-    /// The entire table schema for the table we're using this to adapt.
-    ///
-    /// This is used to evaluate any filters pushed down into the scan
-    /// which may refer to columns that are not referred to anywhere
-    /// else in the plan.
-    pub table_schema: SchemaRef,
-}
-
-impl NestedSchemaAdapter {
-    fn map_schema_nested(
-        &self,
-        fields: &Fields,
-    ) -> datafusion_common::Result<(Arc<NestedSchemaMapping>, Vec<usize>)> {
-        let mut projection = Vec::with_capacity(fields.len());
-        let mut field_mappings = vec![None; self.table_schema.fields().len()];
-
-        // start from the destination fields
-        for (table_idx, table_field) in self.table_schema.fields.iter().enumerate() {
-            // if the file exists in the source, check if we can rewrite it to the destination,
-            // and add it to the projections
-            if let Some((file_idx, file_field)) = fields.find(table_field.name()) {
-                if can_rewrite_field(table_field.clone(), file_field.clone(), true) {
-                    field_mappings[table_idx] = Some(projection.len());
-                    projection.push(file_idx);
-                } else {
-                    return plan_err!(
-                        "Cannot cast file schema field {} of type {:?} to table schema field of type {:?}",
-                        file_field.name(),
-                        file_field.data_type(),
-                        table_field.data_type()
-                    );
-                }
-            }
-        }
-        Ok((
-            Arc::new(NestedSchemaMapping {
-                projected_table_schema: self.projected_table_schema.clone(),
-                field_mappings,
-                table_schema: self.table_schema.clone(),
-            }),
-            projection,
-        ))
-    }
-}
-
-impl SchemaAdapter for NestedSchemaAdapter {
-    fn map_column_index(&self, index: usize, file_schema: &Schema) -> Option<usize> {
-        let field = self.projected_table_schema.field(index);
-        Some(file_schema.fields.find(field.name())?.0)
-    }
-
-    fn map_schema(
-        &self,
-        file_schema: &Schema,
-    ) -> datafusion_common::Result<(Arc<dyn SchemaMapper>, Vec<usize>)> {
-        // self.map_schema_nested(file_schema.fields())
-        //     .map(|(s, v)| (s as Arc<dyn SchemaMapper>, v))
-        trace!(target: "deep", "map_schema:           file_schema: {:#?}", file_schema);
-        trace!(target: "deep", "map_schema:           table_schema: {:#?}", self.table_schema);
-        trace!(target: "deep", "map_schema: projected_table_schema: {:#?}", self.projected_table_schema);
-
-        let mut projection = Vec::with_capacity(file_schema.fields().len());
-        let mut field_mappings = vec![None; self.projected_table_schema.fields().len()];
-
-        for (file_idx, file_field) in file_schema.fields.iter().enumerate() {
-            if let Some((table_idx, table_field)) =
-                self.projected_table_schema.fields().find(file_field.name())
-            {
-                match can_rewrite_field(table_field.clone(), file_field.clone(), true) {
-                    true => {
-                        field_mappings[table_idx] = Some(projection.len());
-                        projection.push(file_idx);
-                    }
-                    false => {
-                        return plan_err!(
-                            "Cannot cast file schema field {} of type {:?} to table schema field of type {:?}",
-                            file_field.name(),
-                            file_field.data_type(),
-                            table_field.data_type()
-                        )
-                    }
-                }
-            }
-        }
-
-        Ok((
-            Arc::new(NestedSchemaMapping {
-                projected_table_schema: self.projected_table_schema.clone(),
-                field_mappings,
-                table_schema: self.table_schema.clone(),
-            }),
-            projection,
-        ))
-    }
-}
-
+/// TODO: struct doc
 #[derive(Debug)]
 pub struct NestedSchemaMapping {
     /// The schema of the table. This is the expected schema after conversion and it should match
@@ -221,7 +120,7 @@ mod tests {
                 true,
             ),
         ]));
-        let out = rewrite_schema(
+        let _ = rewrite_schema(
             schema,
             &vec![1],
             &HashMap::from([
@@ -237,7 +136,7 @@ mod tests {
     async fn test_rewrite() -> crate::error::Result<()> {
         let _ = env_logger::try_init();
 
-        let message_type = "
+        let _message_type = "
         message schema {
             REQUIRED INT32 int1;
             OPTIONAL INT32 int2;
@@ -634,13 +533,13 @@ mod tests {
         let _ = env_logger::try_init();
         let ctx = SessionContext::new();
 
-        let dfr = ctx
+        let _dfr = ctx
             .sql(
                 r#"
             create external table
                 test
             stored as parquet
-            location '/Users/adragomi/work/arrow/benchmark/profile_export_prod_delta/part-00001-1b493913-ef97-4da6-9f8c-da1506b378f1-c000.snappy.parquet'
+            location '../benchmark/adobe_1day_sorted.parquet'
         "#,
             )
             .await
@@ -672,7 +571,7 @@ mod tests {
         let results = df
             .collect()
             .await?;
-        print_batches(results.as_slice());
+        print_batches(results.as_slice()).ok();
         info!("results: {}", results.len());
 
         Ok(())
