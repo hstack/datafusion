@@ -76,6 +76,7 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr_common::datum::compare_op_for_nested;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
+use crate::joins::utils::project_index_to_exprs;
 
 type SharedBitmapBuilder = Mutex<BooleanBufferBuilder>;
 
@@ -1558,6 +1559,7 @@ mod tests {
     use hashbrown::raw::RawTable;
     use rstest::*;
     use rstest_reuse::*;
+    use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
     fn div_ceil(a: usize, b: usize) -> usize {
         a.div_ceil(b)
