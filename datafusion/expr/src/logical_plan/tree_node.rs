@@ -680,22 +680,25 @@ impl LogicalPlan {
                 table_name,
                 source,
                 projection,
+                projection_deep,
                 projected_schema,
                 filters,
                 fetch,
+                ..
             }) => filters
                 .into_iter()
                 .map_until_stop_and_collect(f)?
                 .update_data(|filters| {
-                    LogicalPlan::TableScan(TableScan {
-                        table_name,
-                        source,
-                        projection,
-                        projected_schema,
-                        filters,
-                        fetch,
-                    })
-                }),
+                LogicalPlan::TableScan(TableScan {
+                    table_name,
+                    source,
+                    projection,
+                    projection_deep,
+                    projected_schema,
+                    filters,
+                    fetch,
+                })
+            }),
             LogicalPlan::Distinct(Distinct::On(DistinctOn {
                 on_expr,
                 select_expr,
