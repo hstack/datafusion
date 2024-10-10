@@ -111,15 +111,14 @@ impl SchemaAdapterFactory for DefaultSchemaAdapterFactory {
         projected_table_schema: SchemaRef,
         table_schema: SchemaRef,
     ) -> Box<dyn SchemaAdapter> {
-        // FIX Deep schema mapping
-        Box::new(NestedSchemaAdapter { 
-            projected_table_schema,
-            table_schema
-        })
-        // Box::new(DefaultSchemaAdapter {
+        // Box::new(NestedSchemaAdapter {
         //     projected_table_schema,
-        //     table_schema,
+        //     table_schema
         // })
+        Box::new(DefaultSchemaAdapter {
+            projected_table_schema,
+            table_schema,
+        })
     }
 }
 
