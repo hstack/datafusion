@@ -250,7 +250,6 @@ impl FileScanConfig {
                     }
                     Some(projection_deep) => {
                         trace!("FileScanConfig::project DEEP PROJECT");
-                        let field_arc = Arc::new(self.file_schema.field(idx).clone());
                         let rewritten_field_arc = rewrite_field_projection(self.file_schema.clone(), idx, &projection_deep);
                         trace!("FileScanConfig::project DEEP PROJECT {:#?}", rewritten_field_arc);
                         rewritten_field_arc.as_ref().clone()
