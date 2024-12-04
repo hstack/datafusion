@@ -27,7 +27,6 @@ use arrow_schema::{Schema, SchemaRef};
 use datafusion_common::plan_err;
 use std::fmt::Debug;
 use std::sync::Arc;
-use crate::datasource::schema_adapter_deep::NestedSchemaAdapter;
 
 /// Factory for creating [`SchemaAdapter`]
 ///
@@ -218,10 +217,6 @@ impl SchemaAdapterFactory for DefaultSchemaAdapterFactory {
         projected_table_schema: SchemaRef,
         table_schema: SchemaRef,
     ) -> Box<dyn SchemaAdapter> {
-        // Box::new(NestedSchemaAdapter {
-        //     projected_table_schema,
-        //     table_schema
-        // })
         Box::new(DefaultSchemaAdapter {
             projected_table_schema,
             table_schema,
