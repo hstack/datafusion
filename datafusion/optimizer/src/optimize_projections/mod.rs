@@ -26,12 +26,10 @@ use std::sync::Arc;
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use recursive::recursive;
-use std::collections::HashSet;
-use std::sync::Arc;
 
 use datafusion_common::{
     get_required_group_by_exprs_indices, internal_datafusion_err, internal_err, Column,
-    HashMap, JoinType, Result,
+    JoinType, Result,
 };
 use datafusion_expr::expr::Alias;
 use datafusion_expr::Unnest;
@@ -281,7 +279,7 @@ fn optimize_projections(
 
             let (new_projection, new_projection_deep) = if projection.is_some() {
                 let projection_clone = projection.unwrap().clone();
-                let projection_deep_clone = projection_deep.clone();
+                let _projection_deep_clone = projection_deep.clone();
                 indices.into_mapped_indices_deep(|idx| projection_clone[idx])
             } else {
                 indices.into_inner_deep()
@@ -487,7 +485,7 @@ fn merge_consecutive_projections(proj: Projection) -> Result<Transformed<Project
     };
 
     // Count usages (referrals) of each projection expression in its input fields:
-    let mut column_referral_map = HashMap::<&Column, usize>::new();
+    let mut column_referral_map = datafusion_common::HashMap::<&Column, usize>::new();
     expr.iter()
         .for_each(|expr| expr.add_column_ref_counts(&mut column_referral_map));
 

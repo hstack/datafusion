@@ -345,7 +345,7 @@ fn create_initial_plan(
 //  But, we neeed to walk through both the arrow schema (which KNOWS about the map type)
 //  and the parquet leaves to do this correctly.
 fn equivalent_projection_paths_from_parquet_schema(
-    arrow_schema: SchemaRef,
+    _arrow_schema: SchemaRef,
     parquet_schema: &SchemaDescriptor,
 ) -> Vec<(usize, (String, String))> {
     let mut output: Vec<(usize, (String, String))> = vec![];

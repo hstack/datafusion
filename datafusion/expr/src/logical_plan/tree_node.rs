@@ -616,7 +616,7 @@ impl LogicalPlan {
                     table_name,
                     source,
                     projection,
-                    projection_deep
+                    projection_deep,
                     projected_schema,
                     filters,
                     fetch,

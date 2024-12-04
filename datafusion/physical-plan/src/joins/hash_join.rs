@@ -76,7 +76,6 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr_common::datum::compare_op_for_nested;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
-use crate::joins::utils::project_index_to_exprs;
 
 type SharedBitmapBuilder = Mutex<BooleanBufferBuilder>;
 

@@ -66,7 +66,6 @@ impl RequiredIndicies {
 
     /// Create a new instance with the specified indices as required
     pub fn new_from_indices(indices: Vec<usize>) -> Self {
-        let indices_len = indices.len();
         Self {
             indices,
             deep_indices: HashMap::new(),

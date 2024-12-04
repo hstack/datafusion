@@ -17,9 +17,8 @@
 
 //! The table implementation.
 
-use std::collections::HashMap;
 use std::{any::Any, str::FromStr, sync::Arc};
-
+use std::collections::HashMap;
 use super::helpers::{expr_applicable_for_cols, pruned_partition_list, split_files};
 use super::{ListingTableUrl, PartitionedFile};
 
