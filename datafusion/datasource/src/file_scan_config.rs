@@ -23,9 +23,33 @@ use std::{
     fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
 };
 
+use arrow::{
+    array::{
+        ArrayData, ArrayRef, BufferBuilder, DictionaryArray, RecordBatch,
+        RecordBatchOptions,
+    },
+    buffer::Buffer,
+    datatypes::{ArrowNativeType, DataType, Field, Schema, SchemaRef, UInt16Type},
+};
+use datafusion_common::deep::rewrite_field_projection;
+use datafusion_common::{exec_err, ColumnStatistics, Constraints, Result, Statistics};
+use datafusion_common::{DataFusionError, ScalarValue};
+use datafusion_execution::{
+    object_store::ObjectStoreUrl, SendableRecordBatchStream, TaskContext,
+};
+use datafusion_physical_expr::{
+    expressions::Column, EquivalenceProperties, LexOrdering, Partitioning,
+    PhysicalSortExpr,
+};
+use datafusion_physical_plan::{
+    display::{display_orderings, ProjectSchemaDisplay},
+    metrics::ExecutionPlanMetricsSet,
+    projection::{all_alias_free_columns, new_projections_for_columns, ProjectionExec},
+    DisplayAs, DisplayFormatType, ExecutionPlan,
+};
+use log::{debug, info, trace, warn};
+use datafusion_common::config::ConfigOptions;
 use crate::file_groups::FileGroup;
-#[allow(unused_imports)]
-use crate::schema_adapter::SchemaAdapterFactory;
 use crate::{
     display::FileGroupsDisplay,
     file::FileSource,
@@ -35,34 +59,8 @@ use crate::{
     statistics::MinMaxStatistics,
     PartitionedFile,
 };
-use arrow::{
-    array::{
-        ArrayData, ArrayRef, BufferBuilder, DictionaryArray, RecordBatch,
-        RecordBatchOptions,
-    },
-    buffer::Buffer,
-    datatypes::{ArrowNativeType, DataType, Field, Schema, SchemaRef, UInt16Type},
-};
-use datafusion_common::{
-    config::ConfigOptions, exec_err, ColumnStatistics, Constraints, Result, Statistics,
-};
-use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_execution::{
-    object_store::ObjectStoreUrl, SendableRecordBatchStream, TaskContext,
-};
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::{
-    expressions::Column, EquivalenceProperties, LexOrdering, Partitioning,
-    PhysicalSortExpr,
-};
 use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
-use datafusion_physical_plan::{
-    display::{display_orderings, ProjectSchemaDisplay},
-    metrics::ExecutionPlanMetricsSet,
-    projection::{all_alias_free_columns, new_projections_for_columns, ProjectionExec},
-    DisplayAs, DisplayFormatType, ExecutionPlan,
-};
-use log::{debug, warn};
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -168,6 +166,9 @@ pub struct FileScanConfig {
     /// Columns on which to project the data. Indexes that are higher than the
     /// number of columns of `file_schema` refer to `table_partition_cols`.
     pub projection: Option<Vec<usize>>,
+    /// Columns on which to project the data. Indexes that are higher than the
+    /// number of columns of `file_schema` refer to `table_partition_cols`.
+    pub projection_deep: Option<HashMap<usize, Vec<String>>>,
     /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
     pub limit: Option<usize>,
@@ -253,6 +254,7 @@ pub struct FileScanConfigBuilder {
 
     limit: Option<usize>,
     projection: Option<Vec<usize>>,
+    projection_deep: Option<HashMap<usize, Vec<String>>>,
     table_partition_cols: Vec<Field>,
     constraints: Option<Constraints>,
     file_groups: Vec<FileGroup>,
@@ -286,6 +288,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values: None,
             limit: None,
             projection: None,
+            projection_deep: None,
             table_partition_cols: vec![],
             constraints: None,
             batch_size: None,
@@ -312,6 +315,15 @@ impl FileScanConfigBuilder {
     /// number of columns of `file_schema` refer to `table_partition_cols`.
     pub fn with_projection(mut self, projection: Option<Vec<usize>>) -> Self {
         self.projection = projection;
+        self
+    }
+
+    /// Set the projection of the files
+    pub fn with_projection_deep(
+        mut self,
+        projection_deep: Option<HashMap<usize, Vec<String>>>,
+    ) -> Self {
+        self.projection_deep = projection_deep;
         self
     }
 
@@ -405,6 +417,7 @@ impl FileScanConfigBuilder {
             file_source,
             limit,
             projection,
+            projection_deep,
             table_partition_cols,
             constraints,
             file_groups,
@@ -432,6 +445,7 @@ impl FileScanConfigBuilder {
             file_source,
             limit,
             projection,
+            projection_deep,
             table_partition_cols,
             constraints,
             file_groups,
@@ -456,6 +470,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             new_lines_in_values: Some(config.new_lines_in_values),
             limit: config.limit,
             projection: config.projection,
+            projection_deep: config.projection_deep,
             table_partition_cols: config.table_partition_cols,
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
@@ -661,6 +676,7 @@ impl FileScanConfig {
             file_groups: vec![],
             constraints: Constraints::empty(),
             projection: None,
+            projection_deep: None,
             limit: None,
             table_partition_cols: vec![],
             output_ordering: vec![],
@@ -732,7 +748,23 @@ impl FileScanConfig {
             .into_iter()
             .map(|idx| {
                 if idx < self.file_schema.fields().len() {
-                    self.file_schema.field(idx).clone()
+                    let output_field = match &self.projection_deep {
+                        None => self.file_schema.field(idx).clone(),
+                        Some(projection_deep) => {
+                            trace!("FileScanConfig::project DEEP PROJECT");
+                            let rewritten_field_arc = rewrite_field_projection(
+                                self.file_schema.clone(),
+                                idx,
+                                &projection_deep,
+                            );
+                            trace!(
+                                "FileScanConfig::project DEEP PROJECT {:#?}",
+                                rewritten_field_arc
+                            );
+                            rewritten_field_arc.as_ref().clone()
+                        }
+                    };
+                    output_field
                 } else {
                     let partition_idx = idx - self.file_schema.fields().len();
                     self.table_partition_cols[partition_idx].clone()
@@ -758,6 +790,15 @@ impl FileScanConfig {
     #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
     pub fn with_projection(mut self, projection: Option<Vec<usize>>) -> Self {
         self.projection = projection;
+        self
+    }
+
+    /// Set the projection of the files
+    pub fn with_projection_deep(
+        mut self,
+        projection_deep: Option<HashMap<usize, Vec<String>>>,
+    ) -> Self {
+        self.projection_deep = projection_deep;
         self
     }
 

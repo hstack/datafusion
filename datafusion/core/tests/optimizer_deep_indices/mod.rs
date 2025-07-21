@@ -2,7 +2,6 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 use datafusion::datasource::file_format::parquet::{
     fetch_parquet_metadata, ParquetFormat,
 };
-use datafusion::datasource::physical_plan::ParquetExec;
 use datafusion::logical_expr::Operator;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::test::object_store::local_unpartitioned_file;
@@ -427,10 +426,6 @@ async fn run_deep_projection_optimize_test(
     info!("{}", displayable(physical_plan.deref()).indent(true));
     let mut deep_projections: Vec<Option<DeepColumnIndexMap>> = vec![];
     let _ = physical_plan.apply(|pp| {
-        if let Some(pe) = pp.as_any().downcast_ref::<ParquetExec>() {
-            deep_projections.push(pe.base_config().projection_deep.clone());
-            // pe.base_config().projection_deep
-        }
         if let Some(dse) = pp.as_any().downcast_ref::<DataSourceExec>() {
             let data_source_dyn = dse.data_source();
             if let Some(data_source_file_scan_config) =
