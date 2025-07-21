@@ -2009,10 +2009,12 @@ dependencies = [
  "object_store",
  "parquet",
  "paste",
+ "prost",
  "pyo3",
  "rand 0.9.1",
  "recursive",
  "sqlparser",
+ "substrait",
  "tokio",
  "web-time",
 ]
