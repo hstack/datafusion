@@ -21,10 +21,12 @@
 //! physical format into how they should be used by DataFusion.  For instance, a schema
 //! can be stored external to a parquet file that maps parquet logical types to arrow types.
 
+use crate::schema_adapter_deep::NestedSchemaAdapter;
 use arrow::array::{new_null_array, RecordBatch, RecordBatchOptions};
 use arrow::compute::{can_cast_types, cast};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion_common::{plan_err, ColumnStatistics};
+use log::error;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -208,10 +210,15 @@ impl SchemaAdapterFactory for DefaultSchemaAdapterFactory {
     fn create(
         &self,
         projected_table_schema: SchemaRef,
-        _table_schema: SchemaRef,
+        table_schema: SchemaRef,
     ) -> Box<dyn SchemaAdapter> {
-        Box::new(DefaultSchemaAdapter {
+        // Box::new(DefaultSchemaAdapter {
+        //     projected_table_schema,
+        //     table_schema,
+        // })
+        Box::new(NestedSchemaAdapter {
             projected_table_schema,
+            table_schema,
         })
     }
 }
