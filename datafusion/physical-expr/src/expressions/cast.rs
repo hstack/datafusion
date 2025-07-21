@@ -27,6 +27,7 @@ use arrow::datatypes::{DataType, DataType::*, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_common::{not_impl_err, Result};
+use datafusion_common::deep::can_cast_datatype_deep;
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::sort_properties::ExprProperties;
@@ -228,6 +229,8 @@ pub fn cast_with_options(
     if expr_type == cast_type {
         Ok(Arc::clone(&expr))
     } else if can_cast_types(&expr_type, &cast_type) {
+        Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
+    } else if can_cast_datatype_deep(&expr_type, &cast_type, true) { // FIXME @Hstack - why do we need to fill source fields here ?
         Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
     } else {
         not_impl_err!("Unsupported CAST from {expr_type:?} to {cast_type:?}")
