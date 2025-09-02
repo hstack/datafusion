@@ -30,6 +30,8 @@ use datafusion_common::{
     plan_err, ColumnStatistics,
 };
 use std::{fmt::Debug, sync::Arc};
+use crate::schema_adapter_deep::NestedSchemaAdapter;
+
 /// Function used by [`SchemaMapping`] to adapt a column from the file schema to
 /// the table schema.
 pub type CastColumnFn =
@@ -226,10 +228,15 @@ impl SchemaAdapterFactory for DefaultSchemaAdapterFactory {
     fn create(
         &self,
         projected_table_schema: SchemaRef,
-        _table_schema: SchemaRef,
+        table_schema: SchemaRef,
     ) -> Box<dyn SchemaAdapter> {
-        Box::new(DefaultSchemaAdapter {
+        // Box::new(DefaultSchemaAdapter {
+        //     projected_table_schema,
+        //     table_schema,
+        // })
+        Box::new(NestedSchemaAdapter {
             projected_table_schema,
+            table_schema,
         })
     }
 }
