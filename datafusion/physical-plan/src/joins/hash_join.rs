@@ -24,10 +24,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::{any::Any, vec};
 
-use super::utils::{
-    asymmetric_join_output_partitioning, get_final_indices_from_shared_bitmap,
-    reorder_output_after_swap, swap_join_projection,
-};
+use super::utils::{asymmetric_join_output_partitioning, get_final_indices_from_shared_bitmap, project_index_to_exprs, remap_join_projections_join_to_output, reorder_output_after_swap, swap_join_projection, swap_reverting_projection};
 use super::{
     utils::{OnceAsync, OnceFut},
     PartitionMode, SharedBitmapBuilder,
@@ -630,7 +627,28 @@ impl HashJoinExec {
         {
             Ok(Arc::new(new_join))
         } else {
-            reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
+            // TODO avoid adding ProjectionExec again and again, only adding Final Projection
+            // ADR: FIXME the projection inside the hash join functionality is not consistent
+            // see https://github.com/apache/datafusion/commit/afddb321e9a98ffc1947005c38b6b50a6ef2a401
+            // Failing to do the below code will create a projection exec with a projection that is
+            // possibly outside the schema.
+            let actual_projection = if new_join.projection.is_some() {
+                let tmp = remap_join_projections_join_to_output(
+                    new_join.left().clone(),
+                    new_join.right().clone(),
+                    new_join.join_type(),
+                    new_join.projection.clone(),
+                )?
+                    .unwrap();
+                project_index_to_exprs(&tmp, &new_join.schema())
+            } else {
+                swap_reverting_projection(&left.schema(), &right.schema())
+            };
+            // let swap_proj = swap_reverting_projection(&left.schema(), &right.schema());
+
+            let proj = ProjectionExec::try_new(actual_projection, Arc::new(new_join))?;
+            Ok(Arc::new(proj))
+            // reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
         }
     }
 }
@@ -4721,6 +4739,56 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn join_inner_with_projection() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let left = build_table(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 5]),
+            ("c1", &vec![7, 8, 9]),
+        );
+        let right = build_table(
+            ("a2", &vec![10, 20, 30]),
+            ("b2", &vec![4, 5, 6]),
+            ("c2", &vec![70, 80, 90]),
+        );
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
+        )];
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNull,
+        )?
+            .with_projection(Some(vec![3, 0]))?;
+
+        let batches = common::collect(join.execute(0, task_ctx)?).await?;
+
+        let expected = [
+            "+----+----+",
+            "| a2 | a1 |",
+            "+----+----+",
+            "| 10 | 1  |",
+            "| 20 | 2  |",
+            "| 20 | 3  |",
+            "+----+----+",
+        ];
+
+        // Inner join output is expected to preserve both inputs order
+        assert_batches_eq!(expected, &batches);
+
+        Ok(())
+    }
+
 
     /// Returns the column names on the schema
     fn columns(schema: &Schema) -> Vec<String> {
