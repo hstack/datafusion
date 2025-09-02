@@ -30,6 +30,8 @@ use datafusion_common::{
     plan_err, ColumnStatistics,
 };
 use std::{fmt::Debug, sync::Arc};
+use crate::schema_adapter_deep::NestedSchemaAdapter;
+
 /// Function used by [`SchemaMapping`] to adapt a column from the file schema to
 /// the table schema.
 pub type CastColumnFn =
@@ -226,10 +228,15 @@ impl SchemaAdapterFactory for DefaultSchemaAdapterFactory {
     fn create(
         &self,
         projected_table_schema: SchemaRef,
-        _table_schema: SchemaRef,
+        table_schema: SchemaRef,
     ) -> Box<dyn SchemaAdapter> {
-        Box::new(DefaultSchemaAdapter {
+        // Box::new(DefaultSchemaAdapter {
+        //     projected_table_schema,
+        //     table_schema,
+        // })
+        Box::new(NestedSchemaAdapter {
             projected_table_schema,
+            table_schema,
         })
     }
 }
@@ -237,6 +244,7 @@ impl SchemaAdapterFactory for DefaultSchemaAdapterFactory {
 /// This SchemaAdapter requires both the table schema and the projected table
 /// schema. See  [`SchemaMapping`] for more details
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct DefaultSchemaAdapter {
     /// The schema for the table, projected to include only the fields being output (projected) by the
     /// associated ParquetSource
@@ -246,6 +254,7 @@ pub(crate) struct DefaultSchemaAdapter {
 /// Checks if a file field can be cast to a table field
 ///
 /// Returns Ok(true) if casting is possible, or an error explaining why casting is not possible
+#[allow(dead_code)]
 pub(crate) fn can_cast_field(
     file_field: &Field,
     table_field: &Field,
@@ -315,6 +324,7 @@ impl SchemaAdapter for DefaultSchemaAdapter {
 /// applying type compatibility checking via the provided predicate function.
 ///
 /// Returns field mappings (for column reordering) and a projection (for field selection).
+#[allow(dead_code)]
 pub(crate) fn create_field_mapping<F>(
     file_schema: &Schema,
     projected_table_schema: &SchemaRef,
