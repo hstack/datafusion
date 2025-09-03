@@ -2,7 +2,6 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 use datafusion::datasource::file_format::parquet::{
     fetch_parquet_metadata, ParquetFormat,
 };
-use datafusion::datasource::physical_plan::ParquetExec;
 use datafusion::logical_expr::Operator;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::test::object_store::local_unpartitioned_file;
@@ -427,10 +426,6 @@ async fn run_deep_projection_optimize_test(
     info!("{}", displayable(physical_plan.deref()).indent(true));
     let mut deep_projections: Vec<Option<DeepColumnIndexMap>> = vec![];
     let _ = physical_plan.apply(|pp| {
-        if let Some(pe) = pp.as_any().downcast_ref::<ParquetExec>() {
-            deep_projections.push(pe.base_config().projection_deep.clone());
-            // pe.base_config().projection_deep
-        }
         if let Some(dse) = pp.as_any().downcast_ref::<DataSourceExec>() {
             let data_source_dyn = dse.data_source();
             if let Some(data_source_file_scan_config) =
@@ -731,7 +726,7 @@ async fn test_plain_map() -> Result<()> {
 
     let meta = local_unpartitioned_file(filename.clone());
     let store = Arc::new(LocalFileSystem::new());
-    let metadata = fetch_parquet_metadata(store.deref(), &meta, None).await?;
+    let metadata = fetch_parquet_metadata(store.deref(), &meta, None, None).await?;
     let file_metadata = metadata.file_metadata();
     let parquet_schema = file_metadata.schema_descr();
     parquet_schema
@@ -785,7 +780,7 @@ async fn test_list_struct_map() -> Result<()> {
 
     let meta = local_unpartitioned_file(filename.clone());
     let store = Arc::new(LocalFileSystem::new());
-    let metadata = fetch_parquet_metadata(store.deref(), &meta, None).await?;
+    let metadata = fetch_parquet_metadata(store.deref(), &meta, None, None).await?;
     let file_metadata = metadata.file_metadata();
     let parquet_schema = file_metadata.schema_descr();
     parquet_schema
@@ -849,7 +844,7 @@ async fn test_mid_values_2() -> Result<()> {
 
     let meta = local_unpartitioned_file(filename.clone());
     let store = Arc::new(LocalFileSystem::new());
-    let metadata = fetch_parquet_metadata(store.deref(), &meta, None).await?;
+    let metadata = fetch_parquet_metadata(store.deref(), &meta, None, None).await?;
     let file_metadata = metadata.file_metadata();
     let parquet_schema = file_metadata.schema_descr();
     parquet_schema
@@ -979,7 +974,7 @@ async fn test_mid_values_3() -> Result<()> {
 
     let meta = local_unpartitioned_file(filename.clone());
     let store = Arc::new(LocalFileSystem::new());
-    let metadata = fetch_parquet_metadata(store.deref(), &meta, None).await?;
+    let metadata = fetch_parquet_metadata(store.deref(), &meta, None, None).await?;
     let file_metadata = metadata.file_metadata();
     let parquet_schema = file_metadata.schema_descr();
     parquet_schema
@@ -1099,7 +1094,7 @@ async fn test_mid_values_4() -> Result<()> {
 
     let meta = local_unpartitioned_file(filename.clone());
     let store = Arc::new(LocalFileSystem::new());
-    let metadata = fetch_parquet_metadata(store.deref(), &meta, None).await?;
+    let metadata = fetch_parquet_metadata(store.deref(), &meta, None, None).await?;
     let file_metadata = metadata.file_metadata();
     let parquet_schema = file_metadata.schema_descr();
     parquet_schema
@@ -1250,7 +1245,7 @@ async fn test_mid_values_5() -> Result<()> {
 
     let meta = local_unpartitioned_file(filename.clone());
     let store = Arc::new(LocalFileSystem::new());
-    let metadata = fetch_parquet_metadata(store.deref(), &meta, None).await?;
+    let metadata = fetch_parquet_metadata(store.deref(), &meta, None, None).await?;
     let file_metadata = metadata.file_metadata();
     let parquet_schema = file_metadata.schema_descr();
     parquet_schema
@@ -1314,7 +1309,7 @@ async fn test_billing() -> Result<()> {
 
     let meta = local_unpartitioned_file(filename.clone());
     let store = Arc::new(LocalFileSystem::new());
-    let metadata = fetch_parquet_metadata(store.deref(), &meta, None).await?;
+    let metadata = fetch_parquet_metadata(store.deref(), &meta, None, None).await?;
     let file_metadata = metadata.file_metadata();
     let parquet_schema = file_metadata.schema_descr();
     parquet_schema
@@ -1413,7 +1408,7 @@ async fn test_identity_map() -> Result<()> {
 
     let meta = local_unpartitioned_file(filename.clone());
     let store = Arc::new(LocalFileSystem::new());
-    let metadata = fetch_parquet_metadata(store.deref(), &meta, None).await?;
+    let metadata = fetch_parquet_metadata(store.deref(), &meta, None, None).await?;
     let file_metadata = metadata.file_metadata();
     let parquet_schema = file_metadata.schema_descr();
     parquet_schema
