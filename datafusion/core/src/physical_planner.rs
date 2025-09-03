@@ -55,6 +55,10 @@ use crate::physical_plan::{
     displayable, windows, ExecutionPlan, ExecutionPlanProperties, InputOrderMode,
     Partitioning, PhysicalExpr, WindowExpr,
 };
+
+use datafusion_physical_plan::empty::EmptyExec;
+use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
+
 use crate::schema_equivalence::schema_satisfied_by;
 
 use arrow::array::{builder::StringBuilder, RecordBatch};
@@ -88,15 +92,14 @@ use datafusion_physical_expr::{
     create_physical_sort_exprs, LexOrdering, PhysicalSortExpr,
 };
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
-use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::execution_plan::InvariantLevel;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
-use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
 use datafusion_physical_plan::unnest::ListUnnest;
 use datafusion_sql::TableReference;
 use sqlparser::ast::NullTreatment;
 
 use async_trait::async_trait;
+use datafusion_common::deep::can_rewrite_schema;
 use datafusion_physical_plan::async_func::{AsyncFuncExec, AsyncMapper};
 use futures::{StreamExt, TryStreamExt};
 use itertools::{multiunzip, Itertools};
@@ -450,6 +453,7 @@ impl DefaultPhysicalPlanner {
             LogicalPlan::TableScan(TableScan {
                 source,
                 projection,
+                projection_deep,
                 filters,
                 fetch,
                 ..
@@ -460,7 +464,13 @@ impl DefaultPhysicalPlanner {
                 // referred to in the query
                 let filters = unnormalize_cols(filters.iter().cloned());
                 source
-                    .scan(session_state, projection.as_ref(), &filters, *fetch)
+                    .scan_deep(
+                        session_state,
+                        projection.as_ref(),
+                        projection_deep.as_ref(),
+                        &filters,
+                        *fetch,
+                    )
                     .await?
             }
             LogicalPlan::Values(Values { values, schema }) => {
@@ -675,11 +685,23 @@ impl DefaultPhysicalPlanner {
                 let logical_input_schema = input.as_ref().schema();
                 let physical_input_schema_from_logical = logical_input_schema.inner();
 
-                if !options.execution.skip_physical_aggregate_schema_check
-                    && !schema_satisfied_by(
-                        physical_input_schema_from_logical,
-                        &physical_input_schema,
-                    )
+                let normal_schema_satisfied_by = schema_satisfied_by(
+                    physical_input_schema_from_logical,
+                    &physical_input_schema,
+                );
+
+                let deep_schema_is_satisfied =
+                    if options.optimizer.deep_column_pruning_flags > 0 {
+                        can_rewrite_schema(
+                            physical_input_schema_from_logical,
+                            &physical_input_schema,
+                            false,
+                        )
+                    } else {
+                        false
+                    };
+
+                if !(options.execution.skip_physical_aggregate_schema_check || normal_schema_satisfied_by || deep_schema_is_satisfied)
                 {
                     let mut differences = Vec::new();
                     if physical_input_schema.fields().len()
