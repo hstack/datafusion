@@ -48,7 +48,7 @@ mod physical_optimizer;
 /// Run all tests that are found in the `schema_adapter` directory
 mod schema_adapter;
 
-// mod optimizer_deep_indices;
+mod optimizer_deep_indices;
 
 /// Run all tests that are found in the `serde` directory
 mod serde;
