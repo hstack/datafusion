@@ -17,6 +17,7 @@
 
 //! ParquetSource implementation for reading parquet files
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -56,6 +57,7 @@ use datafusion_physical_plan::DisplayFormatType;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use itertools::Itertools;
+use log::trace;
 use object_store::ObjectStore;
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
@@ -498,6 +500,27 @@ impl FileSource for ParquetSource {
             .file_column_projection_indices()
             .unwrap_or_else(|| (0..base_config.file_schema().fields().len()).collect());
 
+        let projection_deep = match &base_config.projection_deep {
+            None => HashMap::new(),
+            Some(pd) => {
+                let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+                for npi in &projection {
+                    match pd.get(npi) {
+                        None => {}
+                        Some(v) => {
+                            out.insert(*npi, v.clone());
+                        }
+                    }
+                }
+                out
+            }
+        };
+        trace!(
+            "ParquetExec::execute projection={:#?}, projection_deep={:#?}",
+            &projection,
+            &projection_deep
+        );
+
         let (expr_adapter_factory, schema_adapter_factory) = match (
             base_config.expr_adapter_factory.as_ref(),
             self.schema_adapter_factory.as_ref(),
@@ -560,6 +583,7 @@ impl FileSource for ParquetSource {
         Arc::new(ParquetOpener {
             partition_index: partition,
             projection: Arc::from(projection),
+            projection_deep: Arc::new(projection_deep),
             batch_size: self
                 .batch_size
                 .expect("Batch size must set before creating ParquetOpener"),

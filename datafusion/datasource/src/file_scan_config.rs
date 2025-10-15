@@ -64,11 +64,11 @@ use std::{
     any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
     fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
 };
-
+use log::{debug, trace, warn};
+use datafusion_common::deep::rewrite_field_projection;
 use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
-use log::{debug, warn};
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -184,6 +184,9 @@ pub struct FileScanConfig {
     /// schema and table partition columns. If `None`, all columns from the table
     /// schema are projected.
     pub projection_exprs: Option<ProjectionExprs>,
+    /// Columns on which to project the data. Indexes that are higher than the
+    /// number of columns of `file_schema` refer to `table_partition_cols`.
+    pub projection_deep: Option<HashMap<usize, Vec<String>>>,
     /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
     pub limit: Option<usize>,
@@ -268,6 +271,7 @@ pub struct FileScanConfigBuilder {
     file_source: Arc<dyn FileSource>,
     limit: Option<usize>,
     projection_indices: Option<Vec<usize>>,
+    projection_deep: Option<HashMap<usize, Vec<String>>>,
     constraints: Option<Constraints>,
     file_groups: Vec<FileGroup>,
     statistics: Option<Statistics>,
@@ -301,6 +305,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values: None,
             limit: None,
             projection_indices: None,
+            projection_deep: None,
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
@@ -342,6 +347,15 @@ impl FileScanConfigBuilder {
     /// Indexes that are higher than the number of columns of `file_schema` refer to `table_partition_cols`.
     pub fn with_projection_indices(mut self, indices: Option<Vec<usize>>) -> Self {
         self.projection_indices = indices;
+        self
+    }
+
+    /// Set the projection of the files
+    pub fn with_projection_deep(
+        mut self,
+        projection_deep: Option<HashMap<usize, Vec<String>>>,
+    ) -> Self {
+        self.projection_deep = projection_deep;
         self
     }
 
@@ -455,6 +469,7 @@ impl FileScanConfigBuilder {
             file_source,
             limit,
             projection_indices,
+            projection_deep,
             constraints,
             file_groups,
             statistics,
@@ -488,6 +503,7 @@ impl FileScanConfigBuilder {
             file_source,
             limit,
             projection_exprs,
+            projection_deep,
             constraints,
             file_groups,
             output_ordering,
@@ -514,6 +530,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             projection_indices: config
                 .projection_exprs
                 .map(|p| p.ordered_column_indices()),
+            projection_deep: config.projection_deep,
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
@@ -795,7 +812,22 @@ impl FileScanConfig {
             .into_iter()
             .map(|idx| {
                 if idx < self.file_schema().fields().len() {
-                    self.file_schema().field(idx).clone()
+                    let output_field = match &self.projection_deep {
+                        None => self.file_schema().field(idx).clone(),
+                        Some(projection_deep) => {
+                            trace!("FileScanConfig::project DEEP PROJECT");
+                            let rewritten_field_arc = rewrite_field_projection(
+                                self.file_schema(),
+                                idx,
+                                projection_deep,
+                            );
+                            trace!(
+                                "FileScanConfig::project DEEP PROJECT {rewritten_field_arc:#?}"
+                            );
+                            rewritten_field_arc.as_ref().clone()
+                        }
+                    };
+                    output_field
                 } else {
                     let partition_idx = idx - self.file_schema().fields().len();
                     Arc::unwrap_or_clone(Arc::clone(
