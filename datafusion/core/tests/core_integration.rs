@@ -54,7 +54,7 @@ mod schema_adapter;
 /// Run all tests that are found in the `schema_adapter_deep` directory
 mod schema_adapter_deep;
 
-// mod optimizer_deep_indices;
+mod optimizer_deep_indices;
 
 /// Run all tests that are found in the `serde` directory
 mod serde;
