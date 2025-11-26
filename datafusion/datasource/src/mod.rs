@@ -38,6 +38,7 @@ pub mod file_sink_config;
 pub mod file_stream;
 pub mod memory;
 pub mod schema_adapter;
+pub mod schema_adapter_deep;
 pub mod sink;
 pub mod source;
 mod statistics;
