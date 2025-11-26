@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
 use datafusion_common::{
     internal_err, plan_err,
     tree_node::{TreeNode, TreeNodeRecursion},
     DFSchemaRef, Result,
 };
-
+use datafusion_common::deep::can_rewrite_schema;
 use crate::{
     expr::{Exists, InSubquery},
     expr_rewriter::strip_outer_reference,
@@ -114,7 +115,14 @@ fn assert_valid_semantic_plan(plan: &LogicalPlan) -> Result<()> {
 pub fn assert_expected_schema(schema: &DFSchemaRef, plan: &LogicalPlan) -> Result<()> {
     let compatible = plan.schema().logically_equivalent_names_and_types(schema);
 
-    if !compatible {
+    // FIXME @Hstack - integration point
+    let compatible_deep = can_rewrite_schema(
+        Arc::clone(plan.schema()).inner(),
+        Arc::clone(schema).inner(),
+        false
+    );
+
+    if !compatible && !compatible_deep {
         internal_err!(
             "Failed due to a difference in schemas: original schema: {:?}, new schema: {:?}",
             schema,

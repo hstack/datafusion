@@ -33,6 +33,7 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use datafusion_common::deep::can_cast_datatype_deep;
 
 /// Logical representation of a Scalar User Defined Function.
 ///
@@ -240,7 +241,8 @@ impl ScalarUDF {
         // This doesn't use debug_assert!, but it's meant to run anywhere except on production. It's same in spirit, thus conditioning on debug_assertions.
         #[cfg(debug_assertions)]
         {
-            if &result.data_type() != return_field.data_type() {
+            let can_cast_deep = can_cast_datatype_deep(&result.data_type(), return_field.data_type(), false);
+            if &result.data_type() != return_field.data_type() && !can_cast_deep {
                 return datafusion_common::internal_err!("Function '{}' returned value of type '{:?}' while the following type was promised at planning time and expected: '{:?}'",
                         self.name(),
                         result.data_type(),
