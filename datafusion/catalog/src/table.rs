@@ -172,27 +172,6 @@ pub trait TableProvider: Debug + Sync + Send {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
-    /// Create an [`ExecutionPlan`] with an extra parameter
-    /// specifying the deep column projections
-    /// # Deep column projection
-    ///
-    /// If specified, a datasource such as Parquet can do deep projection pushdown.
-    /// In the case of deeply nested schemas (lists in structs etc), the
-    /// implementation can return a smaller schema that rewrites the entire file
-    /// schema to return only the necessary fields, no matter where they are (top-level
-    /// or deep)
-    ///
-    async fn scan_deep(
-           &self,
-            state: &dyn Session,
-            projection: Option<&Vec<usize>>,
-            _projection_deep: Option<&HashMap<usize, Vec<String>>>,
-            filters: &[Expr],
-            limit: Option<usize>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            self.scan(state, projection, filters, limit).await
-    }
-
 
     /// Create an [`ExecutionPlan`] for scanning the table using structured arguments.
     ///
@@ -358,6 +337,7 @@ pub trait TableProvider: Debug + Sync + Send {
 pub struct ScanArgs<'a> {
     filters: Option<&'a [Expr]>,
     projection: Option<&'a [usize]>,
+    projection_deep : Option<&'a HashMap<usize, Vec<String>>>,
     limit: Option<usize>,
 }
 
@@ -380,6 +360,15 @@ impl<'a> ScanArgs<'a> {
     /// no projection was specified (meaning all columns should be included).
     pub fn projection(&self) -> Option<&'a [usize]> {
         self.projection
+    }
+
+    pub fn with_projection_deep(mut self, projection_deep: Option<&'a HashMap<usize, Vec<String>>>) -> Self {
+        self.projection_deep = projection_deep;
+        self
+    }
+
+    pub fn projection_deep(&self) -> Option<&'a HashMap<usize, Vec<String>>> {
+        self.projection_deep
     }
 
     /// Set the filter expressions for the scan.

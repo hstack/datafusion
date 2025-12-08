@@ -55,15 +55,12 @@ use crate::physical_plan::{
     displayable, windows, ExecutionPlan, ExecutionPlanProperties, InputOrderMode,
     Partitioning, PhysicalExpr, WindowExpr,
 };
-
-use datafusion_physical_plan::empty::EmptyExec;
-use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
-
 use crate::schema_equivalence::schema_satisfied_by;
 
 use arrow::array::{builder::StringBuilder, RecordBatch};
 use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
+use datafusion_catalog::ScanArgs;
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::format::ExplainAnalyzeLevel;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
@@ -93,10 +90,12 @@ use datafusion_physical_expr::{
     create_physical_sort_exprs, LexOrdering, PhysicalSortExpr,
 };
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
+use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::execution_plan::InvariantLevel;
 use datafusion_physical_plan::joins::PiecewiseMergeJoinExec;
 use datafusion_physical_plan::metrics::MetricType;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
+use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
 use datafusion_physical_plan::unnest::ListUnnest;
 
 use async_trait::async_trait;
@@ -464,25 +463,14 @@ impl DefaultPhysicalPlanner {
                 // doesn't know (nor should care) how the relation was
                 // referred to in the query
                 let filters = unnormalize_cols(filters.iter().cloned());
-
-                // TO DO switch to scan args
-                // let filters_vec = filters.into_iter().collect::<Vec<_>>();
-                // let opts = ScanArgs::default()
-                //    .with_projection(projection.as_deref())
-                //    .with_filters(Some(&filters_vec))
-                //    .with_limit(*fetch);
-                // let res = source.scan_with_args(session_state, opts).await?;
-                // Arc::clone(res.plan())
-
-                source
-                    .scan_deep(
-                        session_state,
-                        projection.as_ref(),
-                        projection_deep.as_ref(),
-                        &filters,
-                        *fetch,
-                    )
-                    .await?
+                let filters_vec = filters.into_iter().collect::<Vec<_>>();
+                let opts = ScanArgs::default()
+                    .with_projection(projection.as_deref())
+                    .with_projection_deep(projection_deep.as_ref())
+                    .with_filters(Some(&filters_vec))
+                    .with_limit(*fetch);
+                let res = source.scan_with_args(session_state, opts).await?;
+                Arc::clone(res.plan())
             }
             LogicalPlan::Values(Values { values, schema }) => {
                 let exprs = values
