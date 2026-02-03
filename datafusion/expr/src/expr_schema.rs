@@ -657,6 +657,11 @@ impl ExprSchemable for Expr {
     /// expression to the target [arrow::datatypes::DataType].
     fn cast_to(self, cast_to_type: &DataType, schema: &dyn ExprSchema) -> Result<Expr> {
         let this_type = self.get_type(schema)?;
+        // @HStack - see https://github.com/apache/datafusion/issues/19943
+        // currently we cannot activate this -  some failing tests
+        // at datafusion/datafusion/sqllogictest/test_files/case.slt:389
+        // datafusion/datafusion/sqllogictest/test_files/case.slt:400
+        // if this_type.equals_datatype(cast_to_type) {
         if this_type == *cast_to_type {
             return Ok(self);
         }

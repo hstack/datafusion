@@ -939,7 +939,14 @@ fn coerce_arguments_for_signature_with_scalar_udf(
     expressions
         .into_iter()
         .enumerate()
-        .map(|(i, expr)| expr.cast_to(&coerced_types[i], schema))
+        .map(|(i, expr)| {
+            let current_type = expr.get_type(schema)?;
+            // @HStack - deep projection fix
+            if func.name() == "array_element" && current_type.equals_datatype(&coerced_types[i]) {
+                return Ok(expr)
+            }
+            expr.cast_to(&coerced_types[i], schema)
+        })
         .collect()
 }
 
