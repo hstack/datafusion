@@ -81,6 +81,9 @@ recursive = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 tokio = { workspace = true }
 
+prost = { workspace = true }
+substrait = { version = "0.62", features = ["serde"] }
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 web-time = "1.1.0"
 

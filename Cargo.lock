@@ -1936,9 +1936,11 @@ dependencies = [
  "object_store",
  "parquet",
  "paste",
+ "prost",
  "rand 0.9.2",
  "recursive",
  "sqlparser",
+ "substrait",
  "tokio",
  "web-time",
 ]
