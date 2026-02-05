@@ -38,6 +38,8 @@ async-recursion = "1.0"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 datafusion = { workspace = true, features = ["sql"] }
+# Enables the TreeNode implementation for substrait::proto::Rel
+datafusion-common = { workspace = true, features = ["substrait"] }
 half = { workspace = true }
 itertools = { workspace = true }
 object_store = { workspace = true }
@@ -66,3 +68,6 @@ protoc = ["substrait/protoc"]
 # without that, an outdated protobuf compiler may fail to compile the protobuf
 # files as it did in versions 42.0.0 through 44.0.0.
 all-features = true
+
+[package.metadata.cargo-machete]
+ignored = ["datafusion-common"]
