@@ -1028,6 +1028,7 @@ message ProjectionExpr {
 
 message ProjectionExprs {
   repeated ProjectionExpr projections = 1;
+  map<uint32, ProjectionColumns> projection_deep = 20;
 }
 
 message FileScanExecConf {

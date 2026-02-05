@@ -398,6 +398,7 @@ impl TableProvider for ListingTable {
         args: ScanArgs<'a>,
     ) -> datafusion_common::Result<ScanResult> {
         let projection = args.projection().map(|p| p.to_vec());
+        let projection_deep = args.projection_deep().map(|p| p.clone());
         let filters = args.filters().map(|f| f.to_vec()).unwrap_or_default();
         let limit = args.limit();
 
@@ -489,7 +490,8 @@ impl TableProvider for ListingTable {
                     .with_file_groups(partitioned_file_lists)
                     .with_constraints(self.constraints.clone())
                     .with_statistics(statistics)
-                    .with_projection_indices(projection)?
+                    // .with_projection_indices(projection.clone())?
+                    .with_deep_projection(projection.clone(), projection_deep)?
                     .with_limit(limit)
                     .with_output_ordering(output_ordering)
                     .with_expr_adapter(self.expr_adapter_factory.clone())

@@ -579,7 +579,13 @@ pub fn parse_protobuf_file_scan_config(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let projection_exprs = ProjectionExprs::new(projection_exprs);
+        let mut projection_exprs = ProjectionExprs::new(projection_exprs);
+        projection_exprs.projection_deep = Some(proto_projection_exprs.projection_deep
+            .iter()
+            .map(|(k, v)| {
+                (k.clone() as usize, v.columns.clone())
+            })
+            .collect::<std::collections::HashMap<usize, Vec<String>>>());
 
         // Apply projection to file source
         file_source

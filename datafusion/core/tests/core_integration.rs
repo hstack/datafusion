@@ -60,6 +60,8 @@ mod catalog_listing;
 /// Run all tests that are found in the `tracing` directory
 mod tracing;
 
+mod optimizer_deep_indices;
+
 #[cfg(test)]
 #[ctor::ctor]
 fn init() {

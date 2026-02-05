@@ -458,6 +458,7 @@ impl DefaultPhysicalPlanner {
             LogicalPlan::TableScan(TableScan {
                 source,
                 projection,
+                projection_deep,
                 filters,
                 fetch,
                 ..
@@ -470,6 +471,7 @@ impl DefaultPhysicalPlanner {
                 let filters_vec = filters.into_iter().collect::<Vec<_>>();
                 let opts = ScanArgs::default()
                     .with_projection(projection.as_deref())
+                    .with_projection_deep(projection_deep.as_ref())
                     .with_filters(Some(&filters_vec))
                     .with_limit(*fetch);
                 let res = source.scan_with_args(session_state, opts).await?;

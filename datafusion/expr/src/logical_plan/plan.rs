@@ -2677,6 +2677,8 @@ pub struct TableScan {
     pub source: Arc<dyn TableSource>,
     /// Optional column indices to use as a projection
     pub projection: Option<Vec<usize>>,
+    /// Optional column indices to use as a projection
+    pub projection_deep: Option<HashMap<usize, Vec<String>>>,
     /// The schema description of the output
     pub projected_schema: DFSchemaRef,
     /// Optional expressions to be used as filters by the table provider
@@ -2801,6 +2803,7 @@ impl TableScan {
             table_name,
             source: table_source,
             projection,
+            projection_deep: None,
             projected_schema,
             filters,
             fetch,
@@ -4965,6 +4968,7 @@ mod tests {
             table_name: TableReference::bare("tab"),
             source: Arc::clone(&source) as Arc<dyn TableSource>,
             projection: None,
+            projection_deep: None,
             projected_schema: Arc::clone(&schema),
             filters: vec![],
             fetch: None,
@@ -4995,6 +4999,7 @@ mod tests {
             table_name: TableReference::bare("tab"),
             source,
             projection: None,
+            projection_deep: None,
             projected_schema: Arc::clone(&unique_schema),
             filters: vec![],
             fetch: None,

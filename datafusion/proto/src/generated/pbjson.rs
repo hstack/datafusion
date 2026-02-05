@@ -19774,9 +19774,15 @@ impl serde::Serialize for ProjectionExprs {
         if !self.projections.is_empty() {
             len += 1;
         }
+        if !self.projection_deep.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.ProjectionExprs", len)?;
         if !self.projections.is_empty() {
             struct_ser.serialize_field("projections", &self.projections)?;
+        }
+        if !self.projection_deep.is_empty() {
+            struct_ser.serialize_field("projectionDeep", &self.projection_deep)?;
         }
         struct_ser.end()
     }
@@ -19789,11 +19795,14 @@ impl<'de> serde::Deserialize<'de> for ProjectionExprs {
     {
         const FIELDS: &[&str] = &[
             "projections",
+            "projection_deep",
+            "projectionDeep",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Projections,
+            ProjectionDeep,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -19816,6 +19825,7 @@ impl<'de> serde::Deserialize<'de> for ProjectionExprs {
                     {
                         match value {
                             "projections" => Ok(GeneratedField::Projections),
+                            "projectionDeep" | "projection_deep" => Ok(GeneratedField::ProjectionDeep),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -19836,6 +19846,7 @@ impl<'de> serde::Deserialize<'de> for ProjectionExprs {
                     V: serde::de::MapAccess<'de>,
             {
                 let mut projections__ = None;
+                let mut projection_deep__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Projections => {
@@ -19844,10 +19855,20 @@ impl<'de> serde::Deserialize<'de> for ProjectionExprs {
                             }
                             projections__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ProjectionDeep => {
+                            if projection_deep__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("projectionDeep"));
+                            }
+                            projection_deep__ = Some(
+                                map_.next_value::<std::collections::HashMap<::pbjson::private::NumberDeserialize<u32>, _>>()?
+                                    .into_iter().map(|(k,v)| (k.0, v)).collect()
+                            );
+                        }
                     }
                 }
                 Ok(ProjectionExprs {
                     projections: projections__.unwrap_or_default(),
+                    projection_deep: projection_deep__.unwrap_or_default(),
                 })
             }
         }

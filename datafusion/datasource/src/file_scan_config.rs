@@ -54,6 +54,7 @@ use datafusion_physical_plan::{
 };
 use log::{debug, warn};
 use std::{any::Any, fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::Arc};
+use std::collections::HashMap;
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -348,6 +349,46 @@ impl FileScanConfigBuilder {
         }
         Ok(self)
     }
+
+    /// Set the columns on which to project the data using deep column indices !!!!
+    ///
+    /// Indexes that are higher than the number of columns of `file_schema` refer to `table_partition_cols`.
+    /// @HStack @DeepProjection FIXME FOR DEEP !!!!!!!!!
+    pub fn with_deep_projection(
+        mut self,
+        indices: Option<Vec<usize>>,
+        deep_projection: Option<HashMap<usize, Vec<String>>>,
+    ) -> Result<Self> {
+        let projection_exprs = indices.map(|indices| {
+            ProjectionExprs::from_indices(
+                &indices,
+                self.file_source.table_schema().table_schema(),
+            )
+        });
+        let Some(mut projection_exprs) = projection_exprs else {
+            return Ok(self);
+        };
+        projection_exprs.projection_deep = deep_projection.clone();
+
+        let new_source = self
+            .file_source
+            .try_pushdown_projection(&projection_exprs)
+            .map_err(|e| {
+                internal_datafusion_err!(
+                    "Failed to push down projection in FileScanConfigBuilder::build: {e}"
+                )
+            })?;
+        if let Some(new_source) = new_source {
+            self.file_source = new_source;
+        } else {
+            internal_err!(
+                "FileSource {} does not support projection pushdown",
+                self.file_source.file_type()
+            )?;
+        }
+        Ok(self)
+    }
+
 
     /// Set the table constraints
     pub fn with_constraints(mut self, constraints: Constraints) -> Self {

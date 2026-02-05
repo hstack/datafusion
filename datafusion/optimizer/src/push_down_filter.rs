@@ -3119,6 +3119,7 @@ mod tests {
             projection,
             source: Arc::new(test_provider),
             fetch: None,
+            projection_deep: None,
         });
 
         Ok(LogicalPlanBuilder::from(table_scan))

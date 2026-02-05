@@ -1571,6 +1571,8 @@ pub struct ProjectionExpr {
 pub struct ProjectionExprs {
     #[prost(message, repeated, tag = "1")]
     pub projections: ::prost::alloc::vec::Vec<ProjectionExpr>,
+    #[prost(map = "uint32, message", tag = "20")]
+    pub projection_deep: ::std::collections::HashMap<u32, ProjectionColumns>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FileScanExecConf {

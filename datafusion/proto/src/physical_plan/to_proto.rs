@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -46,10 +47,7 @@ use datafusion_physical_plan::udaf::AggregateFunctionExpr;
 use datafusion_physical_plan::windows::{PlainAggregateWindowExpr, WindowUDFExpr};
 use datafusion_physical_plan::{Partitioning, PhysicalExpr, WindowExpr};
 
-use crate::protobuf::{
-    self, PhysicalSortExprNode, PhysicalSortExprNodeCollection,
-    physical_aggregate_expr_node, physical_window_expr_node,
-};
+use crate::protobuf::{self, PhysicalSortExprNode, PhysicalSortExprNodeCollection, physical_aggregate_expr_node, physical_window_expr_node, ProjectionColumns};
 
 use super::PhysicalExtensionCodec;
 
@@ -573,6 +571,12 @@ pub fn serialize_file_scan_config(
         .as_ref()
         .map(|projection_exprs| {
             let projections = projection_exprs.iter().cloned().collect::<Vec<_>>();
+            let projection_deep = projection_exprs.projection_deep
+                .as_ref()
+                .unwrap_or(&HashMap::new())
+                .iter()
+                .map(|(n, v)| (*n as u32, ProjectionColumns { columns: v.clone() }))
+                .collect();
             Ok::<_, DataFusionError>(protobuf::ProjectionExprs {
                 projections: projections
                     .into_iter()
@@ -583,6 +587,7 @@ pub fn serialize_file_scan_config(
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
+                projection_deep,
             })
         })
         .transpose()?;

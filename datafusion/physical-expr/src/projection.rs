@@ -17,6 +17,7 @@
 
 //! [`ProjectionExpr`] and [`ProjectionExprs`] for representing projections.
 
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -60,7 +61,7 @@ pub struct ProjectionExpr {
 
 impl PartialEq for ProjectionExpr {
     fn eq(&self, other: &Self) -> bool {
-        let ProjectionExpr { expr, alias } = self;
+        let ProjectionExpr { expr, alias, .. } = self;
         expr.eq(&other.expr) && *alias == other.alias
     }
 }
@@ -126,6 +127,7 @@ impl From<ProjectionExpr> for (Arc<dyn PhysicalExpr>, String) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionExprs {
     exprs: Vec<ProjectionExpr>,
+    pub projection_deep: Option<HashMap<usize, Vec<String>>>
 }
 
 impl std::fmt::Display for ProjectionExprs {
@@ -137,7 +139,7 @@ impl std::fmt::Display for ProjectionExprs {
 
 impl From<Vec<ProjectionExpr>> for ProjectionExprs {
     fn from(value: Vec<ProjectionExpr>) -> Self {
-        Self { exprs: value }
+        Self { exprs: value, projection_deep: None }
     }
 }
 
@@ -145,6 +147,7 @@ impl From<&[ProjectionExpr]> for ProjectionExprs {
     fn from(value: &[ProjectionExpr]) -> Self {
         Self {
             exprs: value.to_vec(),
+            projection_deep: None
         }
     }
 }
@@ -153,6 +156,7 @@ impl FromIterator<ProjectionExpr> for ProjectionExprs {
     fn from_iter<T: IntoIterator<Item = ProjectionExpr>>(exprs: T) -> Self {
         Self {
             exprs: exprs.into_iter().collect::<Vec<_>>(),
+            projection_deep: None,
         }
     }
 }
@@ -170,6 +174,7 @@ impl ProjectionExprs {
     {
         Self {
             exprs: exprs.into_iter().collect::<Vec<_>>(),
+            projection_deep: None,
         }
     }
 
@@ -227,6 +232,29 @@ impl ProjectionExprs {
 
         Self::from_iter(projection_exprs)
     }
+
+    /// create a ProjectionExprs containing get_field expressions
+    /// @HStack @DeepProjection
+    // ["*.fieldmap.*.*.prop1"]
+    // * list_of_struct_of_list_of_struct - is a list of structs
+    //      fieldmap fieldmap - is a map string -> list of struct
+    //          * - access in the map to the list
+    //              * - access the list
+    //                  prop1 - access the struct prop1
+    pub fn from_projection_deep_indices(indices: &[usize], projection_deep: &HashMap<usize, Vec<String>>, schema: &Schema) -> Self {
+        let projection_exprs = indices.iter().map(|&i| {
+            let field = schema.field(i);
+            ProjectionExpr {
+                expr: Arc::new(Column::new(field.name(), i)),
+                alias: field.name().clone(),
+            }
+        });
+        Self {
+            exprs: projection_exprs.into_iter().collect::<Vec<_>>(),
+            projection_deep: Some(projection_deep.clone())
+        }
+    }
+
 
     /// Returns an iterator over the projection expressions
     pub fn iter(&self) -> impl Iterator<Item = &ProjectionExpr> {
@@ -360,6 +388,8 @@ impl ProjectionExprs {
     /// This function returns an error if any expression in the `other` projection cannot be
     /// applied on top of this projection.
     pub fn try_merge(&self, other: &ProjectionExprs) -> Result<ProjectionExprs> {
+        let self_projection_deep = self.projection_deep.clone();
+        let other_projection_deep = other.projection_deep.clone();
         let mut new_exprs = Vec::with_capacity(other.exprs.len());
         for proj_expr in &other.exprs {
             let new_expr = update_expr(&proj_expr.expr, &self.exprs, true)?
@@ -375,7 +405,15 @@ impl ProjectionExprs {
                 alias: proj_expr.alias.clone(),
             });
         }
-        Ok(ProjectionExprs::new(new_exprs))
+        let mut newpe = ProjectionExprs::new(new_exprs);
+        newpe.projection_deep = if let Some(self_projection_deep) = self_projection_deep {
+            Some(self_projection_deep)
+        } else if let Some(other_projection_deep) = other_projection_deep {
+            Some(other_projection_deep)
+        } else {
+            None
+        };
+        Ok(newpe)
     }
 
     /// Extract the column indices used in this projection.

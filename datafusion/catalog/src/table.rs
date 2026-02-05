@@ -17,6 +17,7 @@
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -360,6 +361,7 @@ pub trait TableProvider: Debug + Sync + Send {
 pub struct ScanArgs<'a> {
     filters: Option<&'a [Expr]>,
     projection: Option<&'a [usize]>,
+    projection_deep: Option<&'a HashMap<usize, Vec<String>>>,
     limit: Option<usize>,
 }
 
@@ -422,6 +424,21 @@ impl<'a> ScanArgs<'a> {
     pub fn limit(&self) -> Option<usize> {
         self.limit
     }
+
+    /// Set projection deep
+    pub fn with_projection_deep(mut self, projection_deep: Option<&'a HashMap<usize, Vec<String>>>) -> Self {
+        self.projection_deep = projection_deep;
+        self
+    }
+
+    /// Get projection deep
+    ///
+    /// Returns the row limit, or `None` if no limit was specified.
+    pub fn projection_deep(&self) -> Option<&'a HashMap<usize, Vec<String>>> {
+        self.projection_deep
+    }
+
+
 }
 
 /// Result of a table scan operation from [`TableProvider::scan_with_args`].

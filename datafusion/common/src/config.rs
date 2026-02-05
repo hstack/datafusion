@@ -1123,6 +1123,10 @@ config_namespace! {
         ///
         /// Default: true
         pub enable_sort_pushdown: bool, default = true
+
+        /// disable deep column pruning
+        pub deep_column_pruning_flags:usize, default = 15
+
     }
 }
 
