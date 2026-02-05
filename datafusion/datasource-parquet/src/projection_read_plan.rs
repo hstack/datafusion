@@ -210,25 +210,13 @@ impl<'schema> PushdownChecker<'schema> {
         self
     }
 
-    /// Checks whether a struct's root column exists in the file schema and, if so,
-    /// records its index so the entire struct is decoded for filter evaluation.
+    /// Records a field path through structs for nested projection.
     ///
-    /// This is called when we see a `get_field` expression that resolves to a
-    /// primitive leaf type. We only need the *root* column index because the
-    /// Parquet reader decodes all leaves of a struct together.
+    /// Array and map traversal cannot be resolved by the struct-only path
+    /// selector, so it reads the whole root column instead.
     ///
-    /// # Example
-    ///
-    /// Given file schema `{a: Int32, s: Struct(foo: Utf8, bar: Int64)}` and the
-    /// expression `get_field(s, 'foo') = 'hello'`:
-    ///
-    /// - `column_name` = `"s"` (the root struct column)
-    /// - `file_schema.index_of("s")` returns `1`
-    /// - We push `1` into `required_columns`
-    /// - Return `None` (no issue — traversal continues in the caller)
-    ///
-    /// If `"s"` is not in the file schema (e.g. a projected-away column), we set
-    /// `projected_columns = true` and return `Jump` to skip the subtree.
+    /// If the root column is missing, marks `projected_columns` and returns
+    /// `Jump` to skip the subtree.
     fn check_struct_field_column(
         &mut self,
         column_name: &str,
@@ -238,6 +226,17 @@ impl<'schema> PushdownChecker<'schema> {
             self.projected_columns = true;
             return Some(TreeNodeRecursion::Jump);
         };
+
+        let mut data_type = self.file_schema.field(idx).data_type();
+        for name in &field_path {
+            let DataType::Struct(fields) = data_type else {
+                return self.check_single_column(column_name);
+            };
+            let Some((_, field)) = fields.find(name) else {
+                return self.check_single_column(column_name);
+            };
+            data_type = field.data_type();
+        }
 
         self.struct_field_accesses.push(StructFieldAccess {
             root_index: idx,
