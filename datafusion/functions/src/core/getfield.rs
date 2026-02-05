@@ -18,14 +18,14 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
-    Array, BooleanArray, Capacities, MutableArrayData, Scalar, cast::AsArray, make_array,
-    make_comparator,
+    Array, ArrayRef, BooleanArray, Capacities, ListArray, MutableArrayData, Scalar,
+    StructArray, cast::AsArray, make_array, make_comparator,
 };
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use arrow_buffer::NullBuffer;
 
-use datafusion_common::cast::{as_map_array, as_struct_array};
+use datafusion_common::cast::{as_list_array, as_map_array, as_struct_array};
 use datafusion_common::{
     Result, ScalarValue, exec_datafusion_err, exec_err, internal_err, plan_datafusion_err,
 };
@@ -40,9 +40,13 @@ use datafusion_macros::user_doc;
 use super::named_struct::NamedStructFunc;
 use super::r#struct::StructFunc;
 
+pub const HANDLE_STRUCT_IN_LIST: bool = true;
+
 #[user_doc(
     doc_section(label = "Other Functions"),
     description = r#"Returns a field within a map or a struct with the given key.
+    For an array of structs, returns an array containing the selected field
+    from each struct. Null structs produce null elements.
     Supports nested field access by providing multiple field names.
     Note: most users invoke `get_field` indirectly via field access
     syntax such as `my_struct_col['field_name']` which results in a call to
@@ -82,7 +86,7 @@ use super::r#struct::StructFunc;
 ```"#,
     argument(
         name = "expression",
-        description = "The map or struct to retrieve a field from."
+        description = "The map, struct, or array of structs to retrieve a field from."
     ),
     argument(
         name = "field_name",
@@ -98,6 +102,55 @@ impl Default for GetFieldFunc {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn projected_list_field(element_field: &Field, field_name: &str) -> Result<FieldRef> {
+    let DataType::Struct(fields) = element_field.data_type() else {
+        return exec_err!("Expected a List of Structs");
+    };
+    let child_field = fields
+        .iter()
+        .find(|field| field.name() == field_name)
+        .ok_or_else(|| plan_datafusion_err!("Field {field_name} not found in struct"))?;
+
+    Ok(Arc::new(
+        child_field
+            .as_ref()
+            .clone()
+            .with_name(element_field.name().clone())
+            .with_nullable(element_field.is_nullable() || child_field.is_nullable()),
+    ))
+}
+
+fn extract_struct_field(array: &StructArray, field_name: &str) -> Result<ArrayRef> {
+    let child = array
+        .column_by_name(field_name)
+        .ok_or_else(|| exec_datafusion_err!("Field {field_name} not found in struct"))?;
+    if array.null_count() == 0 || child.data_type().is_null() {
+        return Ok(Arc::clone(child));
+    }
+
+    let nulls = NullBuffer::union(child.nulls(), array.nulls());
+    Ok(make_array(
+        child.to_data().into_builder().nulls(nulls).build()?,
+    ))
+}
+
+pub fn get_field_from_list(array: &dyn Array, field_name: &str) -> Result<ColumnarValue> {
+    let list_array = as_list_array(array)?;
+    let DataType::List(element_field) = list_array.data_type() else {
+        return exec_err!("Expected a List of Structs");
+    };
+    let projected_field = projected_list_field(element_field, field_name)?;
+    let struct_array = as_struct_array(list_array.values())?;
+    let values = extract_struct_field(struct_array, field_name)?;
+    let projected = ListArray::try_new(
+        projected_field,
+        list_array.offsets().clone(),
+        values,
+        list_array.nulls().cloned(),
+    )?;
+    Ok(ColumnarValue::Array(Arc::new(projected)))
 }
 
 /// Process a map array by finding matching keys and extracting corresponding values.
@@ -193,7 +246,7 @@ fn process_map_with_nested_key(
     Ok(ColumnarValue::Array(data))
 }
 
-/// Extract a single field from a struct or map array
+/// Extract a single field from a struct, map, or list of structs.
 fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<ColumnarValue> {
     let arrays = ColumnarValue::values_to_arrays(&[base])?;
     let array = Arc::clone(&arrays[0]);
@@ -219,6 +272,7 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
                 dict.with_values(Arc::clone(field_col)),
             ))
         }
+        (DataType::List(_), _, Some(key)) => get_field_from_list(array.as_ref(), &key),
         (DataType::Map(_, _), ScalarValue::List(arr), _) => {
             let key_array: Arc<dyn Array> = arr;
             process_map_array(&array, key_array)
@@ -235,12 +289,16 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
             }
         }
         (DataType::Struct(_), _, Some(k)) => {
-            let as_struct_array = as_struct_array(&array)?;
-            match as_struct_array.column_by_name(&k) {
+            let struct_array = as_struct_array(&array)?;
+            match struct_array.column_by_name(&k) {
                 None => exec_err!("Field {k} not found in struct"),
-                Some(col) => Ok(ColumnarValue::Array(Arc::clone(col))),
+                Some(child) => Ok(ColumnarValue::Array(Arc::clone(child))),
             }
         }
+        (DataType::List(_), name, _) => exec_err!(
+            "get_field is only possible on list of structs with utf8 indexes. \
+                         Received with {name:?} index"
+        ),
         (DataType::Struct(_), name, _) => exec_err!(
             "get_field is only possible on struct with utf8 indexes. \
                          Received with {name:?} index"
@@ -446,6 +504,25 @@ impl ScalarUDFImpl for GetFieldFunc {
         // Iterate through each field name (starting from index 1)
         for (i, sv) in args.scalar_arguments.iter().enumerate().skip(1) {
             match current_field.data_type() {
+                DataType::List(element_field) => {
+                    let field_name = sv
+                        .as_ref()
+                        .and_then(|sv| {
+                            sv.try_as_str().flatten().filter(|s| !s.is_empty())
+                        })
+                        .ok_or_else(|| {
+                            exec_datafusion_err!("Field name must be a non-empty string")
+                        })?;
+                    let projected_field =
+                        projected_list_field(element_field, field_name)?;
+                    current_field = Arc::new(
+                        current_field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(DataType::List(projected_field)),
+                    );
+                }
+
                 DataType::Map(map_field, _) => {
                     match map_field.data_type() {
                         DataType::Struct(fields) if fields.len() == 2 => {
@@ -694,6 +771,41 @@ mod tests {
     use super::*;
     use arrow::array::{ArrayRef, Int32Array, StructArray};
     use arrow::datatypes::Fields;
+
+    #[test]
+    fn test_get_field_parent_nulls_plain_struct_and_list() -> Result<()> {
+        let fields: Fields = vec![Field::new("x", DataType::Int32, false)].into();
+        let child: ArrayRef = Arc::new(Int32Array::from(vec![0, 6]));
+        let parent = Arc::new(StructArray::new(
+            fields,
+            vec![Arc::clone(&child)],
+            Some(NullBuffer::from(vec![false, true])),
+        ));
+
+        let extracted = extract_single_field(
+            ColumnarValue::Array(Arc::clone(&parent) as ArrayRef),
+            ScalarValue::Utf8(Some("x".to_string())),
+        )?
+        .into_array(2)?;
+        assert_eq!(extracted.as_ref(), child.as_ref());
+
+        let list = ListArray::new(
+            Arc::new(Field::new("item", parent.data_type().clone(), true)),
+            arrow_buffer::OffsetBuffer::new(vec![0, 2].into()),
+            parent,
+            None,
+        );
+        let projected = get_field_from_list(&list, "x")?.into_array(1)?;
+        let projected = as_list_array(projected.as_ref())?;
+        let expected = Int32Array::from(vec![None, Some(6)]);
+        assert_eq!(projected.values().as_ref(), &expected as &dyn Array);
+        let DataType::List(element_field) = projected.data_type() else {
+            unreachable!()
+        };
+        assert!(element_field.is_nullable());
+
+        Ok(())
+    }
 
     #[test]
     fn test_get_field_utf8view_key() -> Result<()> {

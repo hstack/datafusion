@@ -5965,6 +5965,8 @@ SELECT file_row_index() FROM t;
 ### `get_field`
 
 Returns a field within a map or a struct with the given key.
+For an array of structs, returns an array containing the selected field
+from each struct. Null structs produce null elements.
 Supports nested field access by providing multiple field names.
 Note: most users invoke `get_field` indirectly via field access
 syntax such as `my_struct_col['field_name']` which results in a call to
@@ -5978,7 +5980,7 @@ get_field(expression, field_name[, field_name2, ...])
 
 #### Arguments
 
-- **expression**: The map or struct to retrieve a field from.
+- **expression**: The map, struct, or array of structs to retrieve a field from.
 - **field_name**: The field name(s) to access, in order for nested access. Must evaluate to strings.
 
 #### Example
