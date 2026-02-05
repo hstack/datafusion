@@ -64,6 +64,7 @@ pub mod tree_node;
 pub mod types;
 pub mod utils;
 pub mod deep;
+pub mod substrait_tree;
 
 /// Reexport arrow crate
 pub use arrow;
