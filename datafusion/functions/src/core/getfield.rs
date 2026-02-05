@@ -17,16 +17,12 @@
 
 use std::any::Any;
 use std::sync::Arc;
-
-use arrow::array::{
-    Array, BooleanArray, Capacities, MutableArrayData, Scalar, make_array,
-    make_comparator,
-};
+use arrow::array::{Array, BooleanArray, Capacities, MutableArrayData, Scalar, make_array, make_comparator, ListArray};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use arrow_buffer::NullBuffer;
 
-use datafusion_common::cast::{as_map_array, as_struct_array};
+use datafusion_common::cast::{as_list_array, as_map_array, as_struct_array};
 use datafusion_common::{
     Result, ScalarValue, exec_err, internal_err, plan_datafusion_err,
 };
@@ -37,6 +33,8 @@ use datafusion_expr::{
     ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion_macros::user_doc;
+
+pub const HANDLE_STRUCT_IN_LIST: bool = true;
 
 #[user_doc(
     doc_section(label = "Other Functions"),
@@ -95,6 +93,41 @@ pub struct GetFieldFunc {
 impl Default for GetFieldFunc {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub fn get_field_from_list(
+    array: Arc<dyn Array>,
+    field_name: &str,
+) -> Result<ColumnarValue> {
+    let list_array = as_list_array(array.as_ref())?;
+    match list_array.value_type() {
+        DataType::Struct(fields) => {
+            let (_, offsets, _, nulls) = list_array.clone().into_parts();
+            let struct_array =
+                as_struct_array(list_array.values()).or_else(|_| {
+                    exec_err!("Expected a StructArray inside the ListArray")
+                })?;
+            let Some(field_index) =
+                fields.iter().position(|f| f.name() == field_name)
+            else {
+                return exec_err!("Field {field_name} not found in struct");
+            };
+            let struct_field = &fields[field_index];
+            let new_struct_field = Arc::new(Field::new("element", struct_field.data_type().clone(), struct_field.is_nullable()));
+
+            let projection_array = struct_array.column(field_index);
+
+            let new_list = ListArray::new(
+                new_struct_field,
+                offsets,
+                projection_array.to_owned(),
+                nulls,
+            );
+
+            Ok(ColumnarValue::Array(Arc::new(new_list)))
+        }
+        _ => exec_err!("Expected a ListArray of Structs"),
     }
 }
 
@@ -199,6 +232,21 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
     let string_value = name.try_as_str().flatten().map(|s| s.to_string());
 
     match (array.data_type(), name, string_value) {
+        (DataType::List(field), _, Some(key)) => {
+            if HANDLE_STRUCT_IN_LIST {
+                if let DataType::Struct(_) = field.data_type() {
+                    get_field_from_list(array, &key)
+                } else {
+                    exec_err!("Expected a List of Structs")
+                }
+            } else {
+                exec_err!(
+                    "get_field is only possible on maps with utf8 indexes or struct \
+                         with utf8 indexes."
+                )
+            }
+        }
+
         (DataType::Map(_, _), ScalarValue::List(arr), _) => {
             let key_array: Arc<dyn Array> = arr;
             process_map_array(&array, key_array)
@@ -221,6 +269,10 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
                 Some(col) => Ok(ColumnarValue::Array(Arc::clone(col))),
             }
         }
+        (DataType::List(_), name, _) => exec_err!(
+            "get_field is only possible on list of structs with utf8 indexes. \
+                         Received with {name:?} index"
+        ),
         (DataType::Struct(_), name, _) => exec_err!(
             "get_field is only possible on struct with utf8 indexes. \
                          Received with {name:?} index"
@@ -316,6 +368,37 @@ impl ScalarUDFImpl for GetFieldFunc {
         // Iterate through each field name (starting from index 1)
         for (i, sv) in args.scalar_arguments.iter().enumerate().skip(1) {
             match current_field.data_type() {
+                DataType::List(element_field) => {
+                    if HANDLE_STRUCT_IN_LIST {
+                        if let Some(ScalarValue::Utf8(Some(field_name))) = sv {
+                            if let DataType::Struct(struct_fields) = element_field.data_type() {
+
+                                let filtered_struct_field:FieldRef = struct_fields
+                                    .iter()
+                                    .find(|f| f.name() == field_name)
+                                    .ok_or(plan_datafusion_err!("Field {field_name} not found in struct"))
+                                    .map(|f| f.as_ref().clone().with_nullable(true).into())?;
+                                    // FIXME @Hstack - should be something like value_field.as_ref().clone().with_nullable(true).into()
+                                let new_element_field = Arc::new(Field::new(
+                                    element_field.name(),
+                                    filtered_struct_field.data_type().clone(),
+                                    element_field.is_nullable()
+                                ));
+                                let new_list = Arc::new(Field::new(
+                                    args.arg_fields[0].name(),
+                                    DataType::List(new_element_field),
+                                    true
+                                ));
+                                current_field = new_list;
+                            } else {
+                                return exec_err!("Expected a List of Structs");
+                            }
+                        }
+                    } else {
+                        return exec_err!("The expression to get an indexed field is only valid for `Struct`, `Map` or `Null` types, got {}", &args.arg_fields[0]);
+                    }
+                }
+
                 DataType::Map(map_field, _) => {
                     match map_field.data_type() {
                         DataType::Struct(fields) if fields.len() == 2 => {
