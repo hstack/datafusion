@@ -213,7 +213,10 @@ impl FileGroupPartitioner {
             .iter()
             .map(|f| f.effective_size())
             .sum::<u64>();
-        if total_size < (repartition_file_min_size as u64) || total_size == 0 {
+        if (total_size < (repartition_file_min_size as u64)
+            && target_partitions >= file_groups.len())
+            || total_size == 0
+        {
             return None;
         }
 
@@ -228,6 +231,18 @@ impl FileGroupPartitioner {
             .scan(
                 (current_partition_index, current_partition_size),
                 |(current_partition_index, current_partition_size), source_file| {
+                    if source_file.object_meta.size > 0
+                        && source_file.object_meta.size
+                            < (repartition_file_min_size as u64)
+                    {
+                        *current_partition_size += source_file.object_meta.size;
+                        if *current_partition_size > target_partition_size {
+                            *current_partition_index += 1;
+                            *current_partition_size = 0;
+                        }
+                        let small_file = (*current_partition_index, source_file.clone());
+                        return Some(vec![small_file]);
+                    }
                     let mut produced_files = vec![];
                     let (mut range_start, file_end) = source_file.range();
                     while range_start < file_end {
@@ -477,7 +492,7 @@ impl FileGroup {
         }
 
         if !current_chunk.is_empty() {
-            chunks.push(FileGroup::new(current_chunk))
+            chunks.push(FileGroup::new(current_chunk));
         }
 
         chunks
@@ -1243,6 +1258,79 @@ mod test {
 
         assert_partitioned_files(repartitioned.clone(), repartitioned_preserving_sort);
         repartitioned
+    }
+
+    // --- [HSTACK] small-file consolidation tests ---
+
+    /// Many small files (one group each) with total size below `repartition_file_min_size`
+    /// but more groups than `target_partitions` → consolidate instead of bailing out.
+    ///
+    /// Setup: 5 groups of 1 file each (size=10), min_size=100, target_partitions=2.
+    /// total_size=50 < 100, but len(5) > target(2), so the early-return is skipped.
+    /// target_partition_size = 50/2 = 25.
+    /// Files are bin-packed: a+b → partition 0 (cumulative 20 ≤ 25),
+    /// c overflows (30 > 25) → bumps to partition 1; d+e → partition 1.
+    #[test]
+    fn repartition_consolidates_small_files_many_groups() {
+        let input = vec![
+            FileGroup::new(vec![pfile("a", 10)]),
+            FileGroup::new(vec![pfile("b", 10)]),
+            FileGroup::new(vec![pfile("c", 10)]),
+            FileGroup::new(vec![pfile("d", 10)]),
+            FileGroup::new(vec![pfile("e", 10)]),
+        ];
+
+        let actual = FileGroupPartitioner::new()
+            .with_target_partitions(2)
+            .with_repartition_file_min_size(100)
+            .repartition_file_groups(&input);
+
+        let expected = Some(vec![
+            FileGroup::new(vec![pfile("a", 10), pfile("b", 10)]),
+            FileGroup::new(vec![pfile("c", 10), pfile("d", 10), pfile("e", 10)]),
+        ]);
+        assert_partitioned_files(expected, actual);
+    }
+
+    /// Small files are grouped without byte-range splitting; large files in the same
+    /// dataset are still split by range as before.
+    #[test]
+    fn repartition_small_files_not_range_split() {
+        // One large file (size=80) and four small files (size=5 each), total=100.
+        // min_size=20, target=2, target_partition_size=50.
+        // Large file exceeds min_size → range-split: [0,50) and [50,80).
+        // Small files (size=5 < 20) are bin-packed into whichever partition
+        // the range-splitter left current_partition_index on after splitting the large file.
+        let input = vec![
+            FileGroup::new(vec![pfile("large", 80)]),
+            FileGroup::new(vec![pfile("s1", 5)]),
+            FileGroup::new(vec![pfile("s2", 5)]),
+            FileGroup::new(vec![pfile("s3", 5)]),
+            FileGroup::new(vec![pfile("s4", 5)]),
+        ];
+
+        let actual = FileGroupPartitioner::new()
+            .with_target_partitions(2)
+            .with_repartition_file_min_size(20)
+            .repartition_file_groups(&input);
+
+        // Large file is split into [0,50) on partition 0 and [50,80) on partition 1.
+        // After the split, current_partition_index=1, current_partition_size=30.
+        // s1: 30+5=35 ≤ 50 → partition 1
+        // s2: 35+5=40 ≤ 50 → partition 1
+        // s3: 40+5=45 ≤ 50 → partition 1
+        // s4: 45+5=50 ≤ 50 → partition 1
+        let expected = Some(vec![
+            FileGroup::new(vec![pfile("large", 80).with_range(0, 50)]),
+            FileGroup::new(vec![
+                pfile("large", 80).with_range(50, 80),
+                pfile("s1", 5),
+                pfile("s2", 5),
+                pfile("s3", 5),
+                pfile("s4", 5),
+            ]),
+        ]);
+        assert_partitioned_files(expected, actual);
     }
 
     #[test]
