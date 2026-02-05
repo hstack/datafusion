@@ -213,7 +213,9 @@ impl FileGroupPartitioner {
             .iter()
             .map(|f| f.effective_size())
             .sum::<u64>();
-        if total_size < (repartition_file_min_size as u64) || total_size == 0 {
+        if (total_size < (repartition_file_min_size as u64)
+            && target_partitions >= file_groups.len())
+            || total_size == 0 {
             return None;
         }
 
@@ -228,6 +230,16 @@ impl FileGroupPartitioner {
             .scan(
                 (current_partition_index, current_partition_size),
                 |(current_partition_index, current_partition_size), source_file| {
+                    if source_file.object_meta.size > 0
+                        && source_file.object_meta.size < repartition_file_min_size as u64 {
+                        *current_partition_size += source_file.object_meta.size;
+                        if *current_partition_size > target_partition_size {
+                            *current_partition_index += 1;
+                            *current_partition_size = 0;
+                        }
+                        let small_file = (*current_partition_index, source_file.clone());
+                        return Some(vec![small_file]);
+                    }
                     let mut produced_files = vec![];
                     let (mut range_start, file_end) = source_file.range();
                     while range_start < file_end {
