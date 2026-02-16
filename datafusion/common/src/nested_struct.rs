@@ -214,12 +214,16 @@ pub fn validate_struct_compatibility(
             // Ensure nullability is compatible. It is invalid to cast a nullable
             // source field to a non-nullable target field as this may discard
             // null values.
-            if source_field.is_nullable() && !target_field.is_nullable() {
-                return _plan_err!(
-                    "Cannot cast nullable struct field '{}' to non-nullable field",
-                    target_field.name()
-                );
-            }
+            // @HStack @DeltaIntegration
+            // ATM, we have delta tables where we have fields that are marked nullable in the parquet files, but NON-nullable in the Delta schema
+            // this makes this test fail.
+            // So, we ignore it and we leave the casting. IF there are actual null rows in the data, we'll get an error `Found unmasked nulls for non-nullable`
+            // if source_field.is_nullable() && !target_field.is_nullable() {
+            //     return _plan_err!(
+            //         "Cannot cast nullable struct field '{}' to non-nullable field",
+            //         target_field.name()
+            //     );
+            // }
             // Check if the matching field types are compatible
             match (source_field.data_type(), target_field.data_type()) {
                 // Recursively validate nested structs
