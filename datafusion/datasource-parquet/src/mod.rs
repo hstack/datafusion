@@ -33,7 +33,13 @@ mod sort;
 pub mod source;
 mod supported_predicates;
 mod writer;
+mod leaves;
 
+pub use leaves::{
+    simplified_parquet_column_paths, simplified_parquet_column_path,
+    find_column_in_expr, extract_expressions_containing_column,
+    expr_is_get_field_or_array_or_cast_or_column, fix_simplified_column_path
+};
 pub use access_plan::{ParquetAccessPlan, RowGroupAccess};
 pub use file_format::*;
 pub use metrics::ParquetFileMetrics;

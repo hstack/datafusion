@@ -1071,6 +1071,8 @@ message FileScanExecConf {
   optional uint64 batch_size = 12;
 
   optional ProjectionExprs projection_exprs = 13;
+  optional ProjectionExprs projection_expr_hints = 14;
+  repeated uint32 project_expr_hints_reference = 15;
 }
 
 message ParquetScanExecNode {

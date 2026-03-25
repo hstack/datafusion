@@ -54,8 +54,8 @@ pub struct ScalarFunctionExpr {
     fun: Arc<ScalarUDF>,
     name: String,
     args: Vec<Arc<dyn PhysicalExpr>>,
-    return_field: FieldRef,
-    config_options: Arc<ConfigOptions>,
+    pub return_field: FieldRef,
+    pub config_options: Arc<ConfigOptions>,
 }
 
 impl Debug for ScalarFunctionExpr {
