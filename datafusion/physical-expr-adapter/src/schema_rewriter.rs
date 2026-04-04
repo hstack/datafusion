@@ -452,6 +452,16 @@ impl<'a> DefaultPhysicalExprAdapterRewriter<'a> {
             (DataType::Struct(physical_fields), DataType::Struct(logical_fields)) => {
                 validate_struct_compatibility(physical_fields, logical_fields)?;
             }
+            // Arrow stores MAP as List<key_value: Struct<key, value>>.
+            // Validate the inner key_value struct compatibility so that additive
+            // schema evolution in the value struct (new optional fields) is allowed.
+            (DataType::Map(physical_kv, _), DataType::Map(logical_kv, _)) => {
+                if let (DataType::Struct(physical_fields), DataType::Struct(logical_fields)) =
+                    (physical_kv.data_type(), logical_kv.data_type())
+                {
+                    validate_struct_compatibility(physical_fields, logical_fields)?;
+                }
+            }
             _ => {
                 let is_compatible =
                     can_cast_types(physical_field.data_type(), logical_field.data_type());

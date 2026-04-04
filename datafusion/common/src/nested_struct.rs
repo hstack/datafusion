@@ -17,9 +17,9 @@
 
 use crate::error::{_plan_err, Result};
 use arrow::{
-    array::{Array, ArrayRef, StructArray, new_null_array},
+    array::{Array, ArrayRef, MapArray, StructArray, new_null_array},
     compute::{CastOptions, cast_with_options},
-    datatypes::{DataType::Struct, Field, FieldRef},
+    datatypes::{DataType, DataType::Struct, Field, FieldRef},
 };
 use std::sync::Arc;
 
@@ -157,12 +157,59 @@ pub fn cast_column(
         Struct(target_fields) => {
             cast_struct_column(source_col, target_fields, cast_options)
         }
+        // Handle MAP schema evolution: the key type never changes, but the value
+        // struct may gain optional fields over time (additive schema evolution).
+        // We cast the internal key_value StructArray through cast_column so that
+        // the same struct-evolution logic (null-fill missing fields, drop extras)
+        // applies recursively to the value struct.
+        DataType::Map(target_kv_field, sorted) => {
+            cast_map_column(source_col, target_kv_field, *sorted, cast_options)
+        }
         _ => Ok(cast_with_options(
             source_col,
             target_field.data_type(),
             cast_options,
         )?),
     }
+}
+
+/// Cast a MAP column where the value struct has evolved (additive schema change).
+///
+/// Arrow stores MAP as `List<key_value: Struct<key, value>>`. We cast the inner
+/// key_value StructArray through [`cast_column`] so that missing nullable fields in
+/// the source value struct are filled with nulls and extra source fields are ignored —
+/// the same behaviour as struct-to-struct evolution.
+fn cast_map_column(
+    source_col: &ArrayRef,
+    target_kv_field: &FieldRef,
+    sorted: bool,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef> {
+    let Some(source_map) = source_col.as_any().downcast_ref::<MapArray>() else {
+        return _plan_err!(
+            "Cannot cast column of type {} to map type. Source must be a map.",
+            source_col.data_type()
+        );
+    };
+
+    // Cast the key_value StructArray (key + value fields) using cast_column so
+    // that struct field evolution is handled recursively.
+    let entries: ArrayRef = Arc::new(source_map.entries().clone());
+    let cast_entries = cast_column(&entries, target_kv_field, cast_options)?;
+    let Some(cast_struct) = cast_entries.as_any().downcast_ref::<StructArray>() else {
+        return _plan_err!("cast_map_column: cast entries must produce a StructArray");
+    };
+    let cast_struct = cast_struct.clone();
+
+    // Rebuild the MapArray preserving the original offsets and validity bitmap.
+    let map = MapArray::new(
+        Arc::clone(target_kv_field),
+        source_map.offsets().clone(),
+        cast_struct,
+        source_map.nulls().cloned(),
+        sorted,
+    );
+    Ok(Arc::new(map))
 }
 
 /// Validates compatibility between source and target struct fields for casting operations.
@@ -707,5 +754,128 @@ mod tests {
         let a_col = get_column_as!(&struct_array, "a", Int32Array);
         assert_eq!(a_col.value(0), 1);
         assert_eq!(a_col.value(1), 2);
+    }
+
+    /// Simulates the real AEP scenario: identityMap is Map<String, List<Struct<id>>>
+    /// in older Parquet files, but the Delta log (logical schema) has evolved to
+    /// Map<String, List<Struct<id, primary, authenticatedState>>>.
+    /// The physical files must still be readable — missing value-struct fields
+    /// should be filled with nulls.
+    #[test]
+    fn test_cast_map_with_evolved_value_struct() {
+        use arrow::array::{ListBuilder, StringBuilder, StructBuilder};
+        use arrow::datatypes::Fields;
+
+        // Physical schema: identityMap value struct has only "id"
+        let phys_value_fields: Fields = vec![
+            Arc::new(Field::new("id", DataType::Utf8, true)),
+        ]
+        .into();
+
+        // Build physical MapArray: {"Email": [{id: "abc@example.com"}]}
+        let mut map_builder = {
+            let key_builder = StringBuilder::new();
+            let value_builder = ListBuilder::new(StructBuilder::new(
+                phys_value_fields.clone(),
+                vec![Box::new(StringBuilder::new())],
+            ));
+            MapBuilder::new(None, key_builder, value_builder)
+        };
+        // Row 0: {"Email": [{id: "abc"}]}
+        map_builder.keys().append_value("Email");
+        {
+            let list_builder = map_builder.values();
+            let struct_builder = list_builder.values();
+            struct_builder.field_builder::<StringBuilder>(0).unwrap().append_value("abc");
+            struct_builder.append(true);
+            list_builder.append(true);
+        }
+        map_builder.append(true).unwrap();
+        // Row 1: null map
+        map_builder.append(false).unwrap();
+
+        let phys_map: ArrayRef = Arc::new(map_builder.finish());
+
+        // Logical (target) schema: value struct has "id", "primary", "authenticatedState"
+        let log_value_fields: Fields = vec![
+            Arc::new(Field::new("id", DataType::Utf8, true)),
+            Arc::new(Field::new("primary", DataType::Boolean, true)),
+            Arc::new(Field::new("authenticatedState", DataType::Utf8, true)),
+        ]
+        .into();
+        let log_kv_field = Arc::new(Field::new(
+            "key_value",
+            Struct(vec![
+                Arc::new(Field::new("key", DataType::Utf8, true)),   // nullable to match MapBuilder
+                Arc::new(Field::new(
+                    "value",
+                    DataType::List(Arc::new(Field::new(
+                        "item",
+                        Struct(log_value_fields),
+                        true,
+                    ))),
+                    true,
+                )),
+            ].into()),
+            false,
+        ));
+        let target_field = Field::new(
+            "identityMap",
+            DataType::Map(Arc::clone(&log_kv_field), false),
+            true,
+        );
+
+        // The cast should succeed: missing "primary" and "authenticatedState" filled with nulls
+        let result = cast_column(&phys_map, &target_field, &DEFAULT_CAST_OPTIONS)
+            .expect("cast_map_column should handle value-struct schema evolution");
+
+        let result_map = result.as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(!result_map.is_null(0));
+        assert!(result_map.is_null(1));
+
+        let entries = result_map.value(0);
+        let entries_struct = entries.as_any().downcast_ref::<StructArray>().unwrap();
+        // The key_value struct should have "key" and "value" fields in the logical schema
+        assert!(entries_struct.column_by_name("key").is_some());
+        assert!(entries_struct.column_by_name("value").is_some());
+    }
+
+    /// Validates that the schema_rewriter correctly allows Map→Map schema evolution
+    /// (the compatibility check must not reject additive value-struct changes).
+    #[test]
+    fn test_validate_map_value_struct_compatibility() {
+
+        let phys_kv_fields: Vec<Arc<Field>> = vec![
+            Arc::new(Field::new("key", DataType::Utf8, false)),
+            Arc::new(Field::new(
+                "value",
+                Struct(
+                    vec![Arc::new(Field::new("id", DataType::Utf8, true))].into(),
+                ),
+                true,
+            )),
+        ];
+        let log_kv_fields: Vec<Arc<Field>> = vec![
+            Arc::new(Field::new("key", DataType::Utf8, false)),
+            Arc::new(Field::new(
+                "value",
+                Struct(
+                    vec![
+                        Arc::new(Field::new("id", DataType::Utf8, true)),
+                        Arc::new(Field::new("primary", DataType::Boolean, true)),
+                        Arc::new(Field::new("authenticatedState", DataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                true,
+            )),
+        ];
+
+        // Physical key_value fields (fewer value-struct fields) must be compatible
+        // with logical key_value fields (more value-struct fields).
+        let phys_refs: Vec<Arc<Field>> = phys_kv_fields.into_iter().collect();
+        let log_refs: Vec<Arc<Field>> = log_kv_fields.into_iter().collect();
+        validate_struct_compatibility(&phys_refs, &log_refs)
+            .expect("Map value-struct evolution (additive) should be compatible");
     }
 }
