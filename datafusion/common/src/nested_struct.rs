@@ -756,14 +756,14 @@ mod tests {
         assert_eq!(a_col.value(1), 2);
     }
 
-    /// Simulates the real AEP scenario: identityMap is Map<String, List<Struct<id>>>
-    /// in older Parquet files, but the Delta log (logical schema) has evolved to
-    /// Map<String, List<Struct<id, primary, authenticatedState>>>.
-    /// The physical files must still be readable — missing value-struct fields
-    /// should be filled with nulls.
+    /// Verifies that a MAP column whose value struct has gained optional fields
+    /// can still be read from older Parquet files (additive schema evolution).
+    /// Physical: Map<String, List<Struct<id>>>
+    /// Logical:  Map<String, List<Struct<id, primary, authenticatedState>>>
+    /// Missing value-struct fields must be filled with nulls.
     #[test]
     fn test_cast_map_with_evolved_value_struct() {
-        // Physical schema: identityMap value struct has only "id"
+        // Physical schema: value struct has only "id"
         let phys_value_fields: Fields =
             vec![Arc::new(field("id", DataType::Utf8))].into();
 
@@ -814,10 +814,8 @@ mod tests {
                 .into(),
             ),
         ));
-        let target_field = field(
-            "identityMap",
-            DataType::Map(Arc::clone(&log_kv_field), false),
-        );
+        let target_field =
+            field("my_map", DataType::Map(Arc::clone(&log_kv_field), false));
 
         // The cast should succeed: missing "primary" and "authenticatedState" filled with nulls
         let result = cast_column(&phys_map, &target_field, &DEFAULT_CAST_OPTIONS)
