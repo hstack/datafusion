@@ -307,11 +307,11 @@ mod tests {
     use crate::format::DEFAULT_CAST_OPTIONS;
     use arrow::{
         array::{
-            BinaryArray, Int32Array, Int32Builder, Int64Array, ListArray, MapArray,
-            MapBuilder, StringArray, StringBuilder,
+            BinaryArray, Int32Array, Int32Builder, Int64Array, ListArray, ListBuilder,
+            MapArray, MapBuilder, StringArray, StringBuilder, StructBuilder,
         },
         buffer::NullBuffer,
-        datatypes::{DataType, Field, FieldRef, Int32Type},
+        datatypes::{DataType, Field, FieldRef, Fields, Int32Type},
     };
     /// Macro to extract and downcast a column from a StructArray
     macro_rules! get_column_as {
@@ -763,14 +763,9 @@ mod tests {
     /// should be filled with nulls.
     #[test]
     fn test_cast_map_with_evolved_value_struct() {
-        use arrow::array::{ListBuilder, StringBuilder, StructBuilder};
-        use arrow::datatypes::Fields;
-
         // Physical schema: identityMap value struct has only "id"
-        let phys_value_fields: Fields = vec![
-            Arc::new(Field::new("id", DataType::Utf8, true)),
-        ]
-        .into();
+        let phys_value_fields: Fields =
+            vec![Arc::new(field("id", DataType::Utf8))].into();
 
         // Build physical MapArray: {"Email": [{id: "abc@example.com"}]}
         let mut map_builder = {
@@ -786,7 +781,10 @@ mod tests {
         {
             let list_builder = map_builder.values();
             let struct_builder = list_builder.values();
-            struct_builder.field_builder::<StringBuilder>(0).unwrap().append_value("abc");
+            struct_builder
+                .field_builder::<StringBuilder>(0)
+                .unwrap()
+                .append_value("abc");
             struct_builder.append(true);
             list_builder.append(true);
         }
@@ -798,31 +796,27 @@ mod tests {
 
         // Logical (target) schema: value struct has "id", "primary", "authenticatedState"
         let log_value_fields: Fields = vec![
-            Arc::new(Field::new("id", DataType::Utf8, true)),
-            Arc::new(Field::new("primary", DataType::Boolean, true)),
-            Arc::new(Field::new("authenticatedState", DataType::Utf8, true)),
+            Arc::new(field("id", DataType::Utf8)),
+            Arc::new(field("primary", DataType::Boolean)),
+            Arc::new(field("authenticatedState", DataType::Utf8)),
         ]
         .into();
-        let log_kv_field = Arc::new(Field::new(
+        let log_kv_field = Arc::new(non_null_field(
             "key_value",
-            Struct(vec![
-                Arc::new(Field::new("key", DataType::Utf8, true)),   // nullable to match MapBuilder
-                Arc::new(Field::new(
-                    "value",
-                    DataType::List(Arc::new(Field::new(
-                        "item",
-                        Struct(log_value_fields),
-                        true,
-                    ))),
-                    true,
-                )),
-            ].into()),
-            false,
+            Struct(
+                vec![
+                    Arc::new(field("key", DataType::Utf8)), // nullable to match MapBuilder
+                    Arc::new(field(
+                        "value",
+                        DataType::List(Arc::new(field("item", Struct(log_value_fields)))),
+                    )),
+                ]
+                .into(),
+            ),
         ));
-        let target_field = Field::new(
+        let target_field = field(
             "identityMap",
             DataType::Map(Arc::clone(&log_kv_field), false),
-            true,
         );
 
         // The cast should succeed: missing "primary" and "authenticatedState" filled with nulls
@@ -844,38 +838,31 @@ mod tests {
     /// (the compatibility check must not reject additive value-struct changes).
     #[test]
     fn test_validate_map_value_struct_compatibility() {
-
         let phys_kv_fields: Vec<Arc<Field>> = vec![
-            Arc::new(Field::new("key", DataType::Utf8, false)),
-            Arc::new(Field::new(
+            Arc::new(non_null_field("key", DataType::Utf8)),
+            Arc::new(field(
                 "value",
-                Struct(
-                    vec![Arc::new(Field::new("id", DataType::Utf8, true))].into(),
-                ),
-                true,
+                Struct(vec![Arc::new(field("id", DataType::Utf8))].into()),
             )),
         ];
         let log_kv_fields: Vec<Arc<Field>> = vec![
-            Arc::new(Field::new("key", DataType::Utf8, false)),
-            Arc::new(Field::new(
+            Arc::new(non_null_field("key", DataType::Utf8)),
+            Arc::new(field(
                 "value",
                 Struct(
                     vec![
-                        Arc::new(Field::new("id", DataType::Utf8, true)),
-                        Arc::new(Field::new("primary", DataType::Boolean, true)),
-                        Arc::new(Field::new("authenticatedState", DataType::Utf8, true)),
+                        Arc::new(field("id", DataType::Utf8)),
+                        Arc::new(field("primary", DataType::Boolean)),
+                        Arc::new(field("authenticatedState", DataType::Utf8)),
                     ]
                     .into(),
                 ),
-                true,
             )),
         ];
 
         // Physical key_value fields (fewer value-struct fields) must be compatible
         // with logical key_value fields (more value-struct fields).
-        let phys_refs: Vec<Arc<Field>> = phys_kv_fields.into_iter().collect();
-        let log_refs: Vec<Arc<Field>> = log_kv_fields.into_iter().collect();
-        validate_struct_compatibility(&phys_refs, &log_refs)
+        validate_struct_compatibility(&phys_kv_fields, &log_kv_fields)
             .expect("Map value-struct evolution (additive) should be compatible");
     }
 }
