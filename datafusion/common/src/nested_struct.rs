@@ -865,4 +865,37 @@ mod tests {
         validate_struct_compatibility(&phys_kv_fields, &log_kv_fields)
             .expect("Map value-struct evolution (additive) should be compatible");
     }
+
+    /// Validates that incompatible MAP value-struct changes are rejected.
+    /// A type change on an existing field (Binary → Int32) must fail — this
+    /// exercises the new (Map, Map) code path and confirms errors surface there,
+    /// not silently through the fallback cast.
+    #[test]
+    fn test_validate_map_value_struct_incompatibility() {
+        // Physical: Map(value: Struct({id: Binary}))
+        // Logical:  Map(value: Struct({id: Int32}))  — type change, not additive
+        let phys_kv_fields: Vec<Arc<Field>> = vec![
+            Arc::new(non_null_field("key", DataType::Utf8)),
+            Arc::new(field(
+                "value",
+                Struct(vec![Arc::new(field("id", DataType::Binary))].into()),
+            )),
+        ];
+        let log_kv_fields: Vec<Arc<Field>> = vec![
+            Arc::new(non_null_field("key", DataType::Utf8)),
+            Arc::new(field(
+                "value",
+                Struct(vec![Arc::new(field("id", DataType::Int32))].into()),
+            )),
+        ];
+
+        // Binary → Int32 is incompatible: must fail via the Map code path.
+        let result = validate_struct_compatibility(&phys_kv_fields, &log_kv_fields);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("id"),
+            "error should name the incompatible field"
+        );
+    }
 }
