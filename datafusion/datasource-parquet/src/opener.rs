@@ -57,7 +57,7 @@ use datafusion_common::config::EncryptionFactoryOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use futures::{Stream, StreamExt, TryStreamExt, ready};
-use log::debug;
+use log::{debug, info};
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
@@ -65,6 +65,8 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
+use datafusion_common::deep::{cast_record_batch, rewrite_schema};
+use crate::leaves::{has_simplified_parquet_columns, parquet_leaf_paths, projection_specifier};
 
 /// Implements [`FileOpener`] for a parquet file
 pub(super) struct ParquetOpener {
@@ -72,6 +74,8 @@ pub(super) struct ParquetOpener {
     pub(crate) partition_index: usize,
     /// Projection to apply on top of the table schema (i.e. can reference partition columns).
     pub projection: ProjectionExprs,
+    pub projection_hints: Option<ProjectionExprs>,
+    pub projection_hints_indices: Vec<usize>,
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
@@ -280,6 +284,10 @@ impl FileOpener for ParquetOpener {
 
         let reverse_row_groups = self.reverse_row_groups;
         let preserve_order = self.preserve_order;
+
+        let projection_hints = self.projection_hints.clone();
+        let projection_hints_indices = self.projection_hints_indices.clone();
+
 
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
@@ -612,8 +620,68 @@ impl FileOpener for ParquetOpener {
             // metrics from the arrow reader itself
             let arrow_reader_metrics = ArrowReaderMetrics::enabled();
 
-            let indices = projection.column_indices();
-            let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
+            // @HStack deep projections
+            let mut simplified_parquet_columns = projection_specifier(
+                logical_file_schema.clone(),
+                &projection,
+                projection_hints.as_ref(),
+                &projection_hints_indices
+            );
+            // let mut simplified_parquet_columns = simplified_parquet_column_paths(
+            //     &projection, &logical_file_schema
+            // );
+            let indices = simplified_parquet_columns.keys().cloned().collect();
+            // @DeepProjections
+            info!("ParquetOpener::open deep projections: {:?}", simplified_parquet_columns);
+            simplified_parquet_columns.retain(|key, _val| *key < physical_file_schema.fields().len());
+            info!("ParquetOpener::open cleaned up deep projections: {:?}", simplified_parquet_columns);
+            let has_deep_projection = has_simplified_parquet_columns(&simplified_parquet_columns);
+
+            // we need the logical file schema, but only top level projections
+            // we will use this
+            // FIXME: ACTUALLY PHYSICAL
+            let top_level_projection_logical_file_schema = Arc::new(if has_deep_projection {
+                Some(rewrite_schema(
+                    &physical_file_schema,
+                    &indices,
+                    &indices
+                        .iter()
+                        .map(|idx| (idx.clone(), vec![]))
+                        .collect::<HashMap<usize, Vec<String>>>()
+                ))
+            } else {
+                None
+            });
+            // info!("ParquetOpener.open: top_level_projection_logical_file_schema: {:?}", &top_level_projection_logical_file_schema);
+
+            // @DeepProjections
+            let mask = if has_deep_projection {
+                let leaves = parquet_leaf_paths(
+                    Arc::clone(&physical_file_schema),
+                    builder.parquet_schema(),
+                    &indices,
+                    &simplified_parquet_columns,
+                );
+                debug!(
+                    target: "deep",
+                    "ParquetOpener::open, using deep projection parquet leaves: {:?}",
+                    leaves.clone()
+                );
+                ProjectionMask::leaves(builder.parquet_schema(), leaves)
+            } else {
+		        // let indices = projection.column_indices();
+                debug!(
+                    target: "deep",
+                    "ParquetOpener::open, using root projections: {:?}",
+                    &indices
+                );
+
+                ProjectionMask::roots(
+                    builder.parquet_schema(),
+                    indices.clone(),
+                )
+            };
+            info!("ParquetOpener::open actual final mask: {:?}", &mask);
 
             let stream = builder
                 .with_projection(mask)
@@ -627,7 +695,21 @@ impl FileOpener for ParquetOpener {
                 file_metrics.predicate_cache_inner_records.clone();
             let predicate_cache_records = file_metrics.predicate_cache_records.clone();
 
-            let stream_schema = Arc::clone(stream.schema());
+            // @DeepProjections
+            // this schema does NOT contain the entire schema, because it was built from leaves
+            let stream_schema = if has_deep_projection {
+                // the intermediate output schema
+                // this is the actual output schema - WITHOUT deep projections
+                top_level_projection_logical_file_schema
+                    .clone()
+                    .as_ref()
+                    .clone()
+                    .unwrap()
+                    .clone()
+            } else {
+                Arc::clone(stream.schema())
+            };
+
             // Check if we need to replace the schema to handle things like differing nullability or metadata.
             // See note below about file vs. output schema.
             let replace_schema = !stream_schema.eq(&output_schema);
@@ -647,6 +729,20 @@ impl FileOpener for ParquetOpener {
                         &predicate_cache_inner_records,
                         &predicate_cache_records,
                     );
+                    if has_deep_projection {
+                        let dest_schema = top_level_projection_logical_file_schema
+                            .clone()
+                            .as_ref()
+                            .clone()
+                            .unwrap();
+                        let new_b = cast_record_batch(
+                            &b,
+                            dest_schema,
+                            false,
+                            true
+                        ).unwrap();
+                        b = new_b;
+                    }
                     b = projector.project_batch(&b)?;
                     if replace_schema {
                         // Ensure the output batch has the expected schema.
@@ -1185,6 +1281,8 @@ mod test {
             ParquetOpener {
                 partition_index: self.partition_index,
                 projection,
+                projection_hints: None,
+                projection_hints_indices: vec![],
                 batch_size: self.batch_size,
                 limit: self.limit,
                 predicate: self.predicate,

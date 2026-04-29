@@ -33,6 +33,7 @@ mod sort;
 pub mod source;
 mod supported_predicates;
 mod writer;
+pub mod leaves;
 
 pub use access_plan::{ParquetAccessPlan, RowGroupAccess};
 pub use file_format::*;
