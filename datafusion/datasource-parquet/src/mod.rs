@@ -33,6 +33,8 @@ mod sort;
 pub mod source;
 mod supported_predicates;
 mod writer;
+pub mod leaves;
+pub mod push_all_projection_hints;
 
 pub use access_plan::{ParquetAccessPlan, RowGroupAccess};
 pub use file_format::*;
