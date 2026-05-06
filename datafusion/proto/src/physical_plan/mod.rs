@@ -93,7 +93,7 @@ use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion_physical_plan::{ExecutionPlan, InputOrderMode, PhysicalExpr, WindowExpr};
 use prost::Message;
 use prost::bytes::BufMut;
-
+use datafusion_physical_expr::projection::ProjectionExprs;
 use self::from_proto::parse_protobuf_partitioning;
 use self::to_proto::serialize_partitioning;
 use crate::common::{byte_to_string, str_to_byte};
@@ -913,7 +913,7 @@ impl protobuf::PhysicalPlanNode {
                     .collect();
                 Arc::new(Schema::new(projected_fields))
             } else {
-                schema
+                schema.clone()
             };
 
             let predicate = scan
@@ -958,6 +958,35 @@ impl protobuf::PhysicalPlanNode {
             if let Some(predicate) = predicate {
                 source = source.with_predicate(predicate);
             }
+
+            if let Some(proto_projection_hints) = &scan.projection_hints {
+                let projection_hints: Vec<ProjectionExpr> = proto_projection_hints
+                    .projections
+                    .iter()
+                    .map(|proto_expr| {
+                        let expr = proto_converter.proto_to_physical_expr(
+                            proto_expr.expr.as_ref().ok_or_else(|| {
+                                internal_datafusion_err!("ProjectionExpr missing expr field")
+                            })?,
+                            ctx,
+                            &schema.clone(),
+                            codec,
+                        )?;
+                        Ok(ProjectionExpr::new(expr, proto_expr.alias.clone()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let projection_hints = ProjectionExprs::new(projection_hints);
+                source.projection_hints = projection_hints;
+
+                let projection_hints_indices = scan
+                    .projection_hints_indices
+                    .iter()
+                    .map(|x| x.clone() as usize)
+                    .collect::<Vec<usize>>();
+                source.projection_hints_indices = projection_hints_indices;
+            }
+
             let base_config = parse_protobuf_file_scan_config(
                 base_conf,
                 ctx,
@@ -3087,6 +3116,30 @@ impl protobuf::PhysicalPlanNode {
                 .filter()
                 .map(|pred| proto_converter.physical_expr_to_proto(&pred, codec))
                 .transpose()?;
+
+            let projection_hints = protobuf::ProjectionExprs {
+                projections:  conf
+                    .projection_hints
+                    .as_ref()
+                    .iter()
+                    .map(|expr| {
+                        Ok(protobuf::ProjectionExpr {
+                            alias: expr.alias.to_string(),
+                            expr: Some(
+                                proto_converter
+                                    .physical_expr_to_proto(&expr.expr, codec)?,
+                            ),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+
+            let projection_hints_indices = conf
+                .projection_hints_indices
+                .iter()
+                .map(|x| x.clone() as u64)
+                .collect::<Vec<u64>>();
+
             return Ok(Some(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::ParquetScan(
                     protobuf::ParquetScanExecNode {
@@ -3097,6 +3150,8 @@ impl protobuf::PhysicalPlanNode {
                         )?),
                         predicate,
                         parquet_options: Some(conf.table_parquet_options().try_into()?),
+                        projection_hints: Some(projection_hints),
+                        projection_hints_indices,
                     },
                 )),
             }));
