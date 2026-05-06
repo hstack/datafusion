@@ -585,6 +585,249 @@ async fn roundtrip_parquet_select_projection_predicate() -> Result<()> {
 }
 
 #[tokio::test]
+async fn roundtrip_parquet_deep_projection_hints() -> Result<()> {
+    use arrow::util::pretty::pretty_format_batches;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::{ParquetReadOptions, SessionConfig};
+    use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion_datasource_parquet::push_all_projection_hints::PushAllProjectionHints;
+    use datafusion_physical_plan::collect;
+    use datafusion_proto::bytes::{physical_plan_from_bytes, physical_plan_to_bytes};
+
+    fn hints(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<(Vec<String>, Vec<usize>)>> {
+        let mut hints = vec![];
+        plan.apply(|plan| {
+            if let Some(scan) = plan.downcast_ref::<DataSourceExec>()
+                && let Some((_, source)) = scan.downcast_to_file_source::<ParquetSource>()
+            {
+                hints.push((
+                    source
+                        .projection_hints
+                        .iter()
+                        .map(|hint| format!("{:?}", hint.expr))
+                        .collect(),
+                    source.projection_hints_indices.clone(),
+                ));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(hints)
+    }
+
+    fn bytes_scanned(plan: &Arc<dyn ExecutionPlan>) -> Result<usize> {
+        let mut bytes = 0;
+        plan.apply(|plan| {
+            if let Some(metrics) = plan.metrics()
+                && let Some(value) = metrics.sum_by_name("bytes_scanned")
+            {
+                bytes += value.as_usize();
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(bytes)
+    }
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("deep.parquet");
+    let config = SessionConfig::new().with_target_partitions(1);
+    let baseline = SessionContext::new_with_config(config.clone());
+    baseline
+        .sql(&format!(
+            "COPY (SELECT id, 'prefix' AS unused,
+         named_struct('x', id, 'pad', repeat('padding', 1024)) AS s,
+         [named_struct('x', id, 'pad', repeat('padding', 1024)), NULL] AS events,
+         MAP {{'k': named_struct('x', id, 'pad', repeat('padding', 1024))}} AS m
+         FROM (VALUES (1), (2), (3)) t(id)) TO '{}' STORED AS PARQUET",
+            path.display()
+        ))
+        .await?
+        .collect()
+        .await?;
+    let ctx = SessionContext::new_with_state(
+        SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(PushAllProjectionHints {}))
+            .build(),
+    );
+    for context in [&baseline, &ctx] {
+        context
+            .register_parquet(
+                "deep",
+                path.to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+    }
+    for (query, prune) in [
+        (
+            "SELECT events[1]['x'], m['k']['x'] FROM deep ORDER BY id",
+            true,
+        ),
+        (
+            "SELECT s['x'], events[1]['x'], m['k']['x'], rn FROM (
+            SELECT s, events, m, row_number() OVER (ORDER BY id) AS rn FROM deep
+         ) q ORDER BY rn",
+            true,
+        ),
+        ("SELECT 1 AS value FROM deep", false),
+    ] {
+        let base_plan = baseline.sql(query).await?.create_physical_plan().await?;
+        let expected = collect(Arc::clone(&base_plan), baseline.task_ctx()).await?;
+        let plan = ctx.sql(query).await?.create_physical_plan().await?;
+        let signature = hints(&plan)?;
+        assert!(!signature.is_empty());
+        assert!(signature.iter().all(|(hints, _)| hints.is_empty() != prune));
+        let encoded = physical_plan_to_bytes(Arc::clone(&plan))?;
+        let restored = physical_plan_from_bytes(&encoded, &ctx.task_ctx())?;
+        let plans = vec![plan, restored];
+        #[cfg(feature = "json")]
+        let plans = {
+            let mut plans = plans;
+            use datafusion_proto::bytes::{
+                physical_plan_from_json, physical_plan_to_json,
+            };
+            let json = physical_plan_to_json(Arc::clone(&plans[0]))?;
+            if prune {
+                assert!(json.contains("projectionHints"));
+            }
+            plans.push(physical_plan_from_json(&json, &ctx.task_ctx())?);
+            plans
+        };
+        let mut reads = vec![];
+        for plan in plans {
+            assert_eq!(hints(&plan)?, signature);
+            let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+            assert_eq!(plan.schema(), base_plan.schema());
+            assert_eq!(
+                pretty_format_batches(&batches)?.to_string(),
+                pretty_format_batches(&expected)?.to_string()
+            );
+            reads.push(bytes_scanned(&plan)?);
+        }
+        if prune {
+            assert!(reads[0] < bytes_scanned(&base_plan)?, "{query}: {reads:?}");
+        } else {
+            assert_eq!(reads[0], bytes_scanned(&base_plan)?, "{query}");
+        }
+        assert!(
+            reads.iter().all(|&bytes| bytes == reads[0]),
+            "{query}: {reads:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn parquet_deep_projection_rejects_malformed_hints_and_accepts_legacy_plans() -> Result<()>
+{
+    use datafusion_datasource::file::FileSource;
+    use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("unused", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::local_filesystem(),
+        Arc::new(ParquetSource::new(schema)),
+    )
+    .with_projection_indices(Some(vec![1]))?
+    .build();
+    let mut source = config
+        .file_source()
+        .downcast_ref::<ParquetSource>()
+        .unwrap()
+        .clone();
+    source.projection_hints = ProjectionExprs::new([ProjectionExpr::new(
+        Arc::new(Column::new("value", 1)),
+        "",
+    )]);
+    source.projection_hints_indices = vec![0];
+    let config = FileScanConfigBuilder::from(config)
+        .with_source(Arc::new(source))
+        .build();
+    let node = PhysicalPlanNode::try_from_physical_plan(
+        DataSourceExec::from_data_source(config),
+        &DefaultPhysicalExtensionCodec {},
+    )?;
+    let ctx = SessionContext::new();
+    for index in [1, u64::MAX] {
+        let mut invalid = node.clone();
+        let Some(
+            datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType::ParquetScan(
+                scan,
+            ),
+        ) = &mut invalid.physical_plan_type
+        else {
+            panic!("Expected a Parquet scan");
+        };
+        scan.projection_hints_indices = vec![index];
+        let error = invalid
+            .try_into_physical_plan(&ctx.task_ctx(), &DefaultPhysicalExtensionCodec {})
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Deep projection hint index"),
+            "{error}"
+        );
+    }
+    let mut missing = node.clone();
+    let Some(
+        datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType::ParquetScan(
+            scan,
+        ),
+    ) = &mut missing.physical_plan_type
+    else {
+        panic!("Expected a Parquet scan");
+    };
+    scan.projection_hints.as_mut().unwrap().projections[0].expr = None;
+    let error = missing
+        .try_into_physical_plan(&ctx.task_ctx(), &DefaultPhysicalExtensionCodec {})
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("missing its expression"),
+        "{error}"
+    );
+    let mut legacy = node;
+    let Some(
+        datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType::ParquetScan(
+            scan,
+        ),
+    ) = &mut legacy.physical_plan_type
+    else {
+        panic!("Expected a Parquet scan");
+    };
+    scan.projection_hints = None;
+    let error = legacy
+        .try_into_physical_plan(&ctx.task_ctx(), &DefaultPhysicalExtensionCodec {})
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("require projection hints"),
+        "{error}"
+    );
+    let Some(
+        datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType::ParquetScan(
+            scan,
+        ),
+    ) = &mut legacy.physical_plan_type
+    else {
+        panic!("Expected a Parquet scan");
+    };
+    scan.projection_hints_indices.clear();
+    let restored = legacy
+        .try_into_physical_plan(&ctx.task_ctx(), &DefaultPhysicalExtensionCodec {})?;
+    let (_, source) = restored
+        .downcast_ref::<DataSourceExec>()
+        .unwrap()
+        .downcast_to_file_source::<ParquetSource>()
+        .unwrap();
+    assert!(source.projection_hints.as_ref().is_empty());
+    assert!(source.projection_hints_indices.is_empty());
+    assert_eq!(source.projection().unwrap().as_ref().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn roundtrip_empty_projection() -> Result<()> {
     let ctx = all_types_context().await?;
     let sql = "select 1 from alltypes_plain";
