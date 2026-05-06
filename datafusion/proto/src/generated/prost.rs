@@ -1629,6 +1629,10 @@ pub struct ParquetScanExecNode {
     pub parquet_options: ::core::option::Option<
         super::datafusion_common::TableParquetOptions,
     >,
+    #[prost(message, optional, tag = "5")]
+    pub projection_hints: ::core::option::Option<ProjectionExprs>,
+    #[prost(uint64, repeated, tag = "6")]
+    pub projection_hints_indices: ::prost::alloc::vec::Vec<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CsvScanExecNode {
