@@ -55,6 +55,10 @@ shape. Unknown operators retain complete reads. Final aggregate stages retain
 their accumulator inputs.
 The existing schema-driven projection remains active without this rule.
 
+Binary and JSON physical-plan serialization preserve the hints. Plans without
+hints retain their existing behavior. Invalid hint indices and missing hint
+expressions fail during decoding.
+
 Do not reuse a hinted scan with new consumers unless you rerun the optimizer.
 Its hints describe the complete optimized plan, not an independent scan.
 

@@ -92,4 +92,5 @@ datafusion-functions-aggregate = { workspace = true }
 datafusion-functions-window-common = { workspace = true }
 doc-comment = { workspace = true }
 pretty_assertions = "1.4"
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

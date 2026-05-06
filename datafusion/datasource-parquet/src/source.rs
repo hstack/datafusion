@@ -1099,15 +1099,58 @@ impl FileSource for ParquetSource {
         use datafusion_proto_models::protobuf;
         use protobuf::physical_plan_node::PhysicalPlanType;
 
+        if self.projection_hints.as_ref().is_empty()
+            && !self.projection_hints_indices.is_empty()
+        {
+            return datafusion_common::internal_err!(
+                "Deep projection hint indices require nonempty projection hints"
+            );
+        }
+        for &index in &self.projection_hints_indices {
+            if index >= self.projection.as_ref().len() {
+                return datafusion_common::internal_err!(
+                    "Deep projection hint index {index} is outside the scan projection"
+                );
+            }
+        }
         let predicate = self
             .filter()
             .map(|pred| ctx.encode_expr(&pred))
             .transpose()?;
+        let projection_hints = if self.projection_hints.as_ref().is_empty() {
+            None
+        } else {
+            Some(protobuf::ProjectionExprs {
+                projections: self
+                    .projection_hints
+                    .iter()
+                    .map(|hint| {
+                        Ok(protobuf::ProjectionExpr {
+                            expr: Some(ctx.encode_expr(&hint.expr)?),
+                            alias: hint.alias.to_string(),
+                        })
+                    })
+                    .collect::<datafusion_common::Result<Vec<_>>>()?,
+            })
+        };
+        let projection_hints_indices = self
+            .projection_hints_indices
+            .iter()
+            .map(|&index| {
+                u64::try_from(index).map_err(|_| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Deep projection hint index does not fit uint64"
+                    )
+                })
+            })
+            .collect::<datafusion_common::Result<Vec<_>>>()?;
 
         let node = protobuf::ParquetScanExecNode {
             base_conf: Some(base.try_to_proto(ctx)?),
             predicate,
             parquet_options: Some(self.table_parquet_options().try_into()?),
+            projection_hints,
+            projection_hints_indices,
         };
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::ParquetScan(node)),
@@ -1128,8 +1171,10 @@ impl ParquetSource {
         use arrow::datatypes::Schema;
         use datafusion_common::config::TableParquetOptions;
         use datafusion_datasource::file_scan_config::FileScanConfig;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
         use datafusion_datasource::source::DataSourceExec;
         use datafusion_execution::object_store::ObjectStoreUrl;
+        use datafusion_physical_expr::projection::ProjectionExpr;
         use datafusion_proto_models::protobuf;
 
         let scan = match &node.physical_plan_type {
@@ -1212,6 +1257,65 @@ impl ParquetSource {
         }
         let base_config =
             FileScanConfig::try_from_proto(base_conf, ctx, Arc::new(source))?;
+        // Shared projection decoding calls try_pushdown_projection, which
+        // invalidates hints. Install them only after that reconstruction.
+        let mut source = base_config
+            .file_source()
+            .downcast_ref::<ParquetSource>()
+            .ok_or_else(|| {
+                datafusion_common::internal_datafusion_err!(
+                    "Decoded Parquet scan has a non-Parquet source"
+                )
+            })?
+            .clone();
+        let projection_len = source.projection.as_ref().len();
+        source.projection_hints_indices = scan.projection_hints_indices.iter()
+            .map(|&index| {
+                let index = usize::try_from(index).map_err(|_| {
+                    datafusion_common::internal_datafusion_err!(
+                        "Deep projection hint index {index} does not fit usize"
+                    )
+                })?;
+                if index >= projection_len {
+                    return datafusion_common::internal_err!(
+                        "Deep projection hint index {index} is outside scan projection of length {projection_len}"
+                    );
+                }
+                Ok(index)
+            }).collect::<datafusion_common::Result<Vec<_>>>()?;
+        if let Some(hints) = &scan.projection_hints {
+            if hints.projections.is_empty() && !source.projection_hints_indices.is_empty()
+            {
+                return datafusion_common::internal_err!(
+                    "Deep projection hint indices require nonempty projection hints"
+                );
+            }
+            let schema = source.table_schema().table_schema();
+            source.projection_hints = ProjectionExprs::new(
+                hints
+                    .projections
+                    .iter()
+                    .map(|hint| {
+                        let expr = hint.expr.as_ref().ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "Deep projection hint is missing its expression"
+                            )
+                        })?;
+                        Ok(ProjectionExpr::new(
+                            ctx.decode_expr(expr, schema.as_ref())?,
+                            hint.alias.clone(),
+                        ))
+                    })
+                    .collect::<datafusion_common::Result<Vec<_>>>()?,
+            );
+        } else if !source.projection_hints_indices.is_empty() {
+            return datafusion_common::internal_err!(
+                "Deep projection hint indices require projection hints"
+            );
+        }
+        let base_config = FileScanConfigBuilder::from(base_config)
+            .with_source(Arc::new(source))
+            .build();
         Ok(DataSourceExec::from_data_source(base_config))
     }
 }
