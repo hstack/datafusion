@@ -1131,6 +1131,9 @@ message ParquetScanExecNode {
   PhysicalExprNode predicate = 3;
 
   datafusion_common.TableParquetOptions parquet_options = 4;
+
+  optional ProjectionExprs projection_hints = 5;
+  repeated uint64 projection_hints_indices = 6;
 }
 
 message CsvScanExecNode {
