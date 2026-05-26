@@ -58,7 +58,7 @@ use datafusion_common::config::EncryptionFactoryOptions;
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use futures::{Stream, StreamExt, TryStreamExt, ready};
 use itertools::Itertools;
-use log::{debug, info, trace};
+use log::{debug, trace};
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
@@ -714,7 +714,7 @@ impl FileOpener for ParquetOpener {
                     indices
                 )
             };
-            info!("ParquetOpener::open actual final mask: {:?}", &mask);
+            trace!(target:"deep", "ParquetOpener::open actual final mask: {:?}", &mask);
 
             let stream = builder
                 .with_projection(mask)
