@@ -42,6 +42,8 @@ use datafusion_expr::{ColumnarValue, expr_vec_fmt};
 use ahash::RandomState;
 use datafusion_common::HashMap;
 use hashbrown::hash_map::RawEntryMut;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use crate::expressions::{Column, Literal};
 
 /// Trait for InList static filters
 trait StaticFilter {
@@ -684,8 +686,23 @@ impl InListExpr {
         negated: bool,
         schema: &Schema,
     ) -> Result<Self> {
+        // @HStack - temporary fix 
+        // possibly rewrite the column indices !!!
+        let new_expr = expr.clone().transform(|e| {
+            if let Some(column) = e.as_any().downcast_ref::<Column>() {
+                let column_name = column.name();
+                return if let Ok(new_index) = schema.index_of(column_name) {
+                    Ok(Transformed::yes(Arc::new(Column::new(column_name, new_index)) as Arc<dyn PhysicalExpr>))
+                } else {
+                    Ok(Transformed::no(e))
+                }
+            }
+            Ok(Transformed::no(e))
+        })
+            .data()?;
+
         // Check the data types match
-        let expr_data_type = expr.data_type(schema)?;
+        let expr_data_type = new_expr.data_type(schema)?;
         for list_expr in list.iter() {
             let list_expr_data_type = list_expr.data_type(schema)?;
             assert_or_internal_err!(
