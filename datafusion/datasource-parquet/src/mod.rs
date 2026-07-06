@@ -47,6 +47,8 @@ mod supported_predicates;
 mod test_util;
 mod virtual_column;
 mod writer;
+pub mod leaves;
+pub mod push_all_projection_hints;
 
 pub use access_plan::{ParquetAccessPlan, ParquetRowSelection, RowGroupAccess};
 pub use bloom_filter::BloomFilterStatistics;

@@ -2074,6 +2074,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-expr-adapter",
  "datafusion-physical-expr-common",
+ "datafusion-physical-optimizer",
  "datafusion-physical-plan",
  "datafusion-proto-models",
  "datafusion-pruning",

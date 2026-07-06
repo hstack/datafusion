@@ -65,6 +65,7 @@ mod extension_types;
 
 /// Helper functions for tests.
 mod helper;
+mod optimizer_deep_indices;
 
 #[cfg(test)]
 #[ctor::ctor(unsafe)]

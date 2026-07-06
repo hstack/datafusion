@@ -72,7 +72,7 @@ use datafusion_common::config::EncryptionFactoryOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
-use log::debug;
+use log::{debug, trace};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -239,6 +239,8 @@ pub(super) struct ParquetMorselizer {
     pub(crate) partition_index: usize,
     /// Projection to apply on top of the table schema (i.e. can reference partition columns).
     pub projection: ProjectionExprs,
+    pub projection_hints: Option<ProjectionExprs>,
+    pub projection_hints_indices: Vec<usize>,
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
@@ -438,6 +440,8 @@ struct PreparedParquetOpen {
     physical_file_schema: SchemaRef,
     output_schema: SchemaRef,
     projection: ProjectionExprs,
+    projection_hints: Option<ProjectionExprs>,
+    projection_hints_indices: Vec<usize>,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Per-scan virtual-column state, Arc-cloned from [`ParquetMorselizer`] so
     /// each file shares validated fields, precomputed null replacements, and
@@ -750,6 +754,8 @@ impl ParquetMorselizer {
         // Calculate the output schema from the original projection (before literal replacement)
         // so we get correct field names from column references
         let logical_file_schema = Arc::clone(self.table_schema.file_schema());
+        trace!(target: "deep", "ParquetMorselizer::open logical_file_schema: {:#?}", &logical_file_schema);
+
         let output_schema = Arc::new(
             self.projection
                 .project_schema(self.table_schema.table_schema())?,
@@ -839,6 +845,8 @@ impl ParquetMorselizer {
             physical_file_schema: logical_file_schema,
             output_schema,
             projection,
+            projection_hints: self.projection_hints.clone(),
+            projection_hints_indices: self.projection_hints_indices.clone(),
             predicate,
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
@@ -957,6 +965,7 @@ impl MetadataLoadedParquetOpen {
         //   virtual columns (see [`crate::TableSchema::virtual_columns`]) are
         //   produced separately by the reader and are not part of this schema.
         let mut physical_file_schema = Arc::clone(reader_metadata.schema());
+        trace!(target: "deep", "MetadataLoadedParquetOpen::prepare_filters physical_file_schema 1: {:#?}", &physical_file_schema);
 
         // The schema loaded from the file may not be the same as the
         // desired schema (for example if we want to instruct the parquet
@@ -970,6 +979,7 @@ impl MetadataLoadedParquetOpen {
             options = options.with_schema(Arc::clone(&physical_file_schema));
             metadata_dirty = true;
         }
+        trace!(target: "deep", "MetadataLoadedParquetOpen::prepare_filters physical_file_schema 2: {:#?}", &physical_file_schema);
 
         if let Some(ref coerce) = prepared.coerce_int96
             && let Some(merged) = Int96Coercer::new(
@@ -998,6 +1008,7 @@ impl MetadataLoadedParquetOpen {
                 options.clone(),
             )?;
         }
+        trace!(target: "deep", "MetadataLoadedParquetOpen::prepare_filters physical_file_schema 3: {:#?}", &physical_file_schema);
 
         // Adapt the projection & filter predicate to the physical file schema.
         // This evaluates missing columns and inserts any necessary casts.
@@ -1426,13 +1437,18 @@ impl RowGroupsPrunedParquetOpen {
         // Build the decoder projection (mask + per-batch transform) in a
         // single call. Encapsulating it behind `DecoderProjection` keeps the
         // opener's orchestration body focused on filter / decoder / stream
-        // wiring.
+        // wiring. `@HStack` deep-projection hints (when present) let this
+        // narrow the read plan to specific struct/list leaves instead of
+        // whole root columns.
         let decoder_projection = DecoderProjection::try_new(
             &prepared.projection,
             &prepared.physical_file_schema,
             reader_metadata.parquet_schema(),
             &prepared.output_schema,
             prepared.virtual_state.as_deref(),
+            &prepared.logical_file_schema,
+            prepared.projection_hints.as_ref(),
+            &prepared.projection_hints_indices,
         )?;
 
         let (decoder, rg_plan, has_row_selection) = {
@@ -1792,6 +1808,9 @@ mod test {
         partition_index: usize,
         projection_indices: Option<Vec<usize>>,
         projection: Option<ProjectionExprs>,
+        pub projection_hints: Option<ProjectionExprs>,
+        pub projection_hints_indices: Vec<usize>,
+
         batch_size: usize,
         limit: Option<usize>,
         predicate: Option<Arc<dyn PhysicalExpr>>,
@@ -2003,6 +2022,8 @@ mod test {
                 partition_index: 0,
                 projection_indices: None,
                 projection: None,
+                projection_hints: None,
+                projection_hints_indices: vec![],
                 batch_size: 1024,
                 limit: None,
                 predicate: None,
@@ -2166,6 +2187,8 @@ mod test {
             Ok(ParquetMorselizer {
                 partition_index: self.partition_index,
                 projection,
+                projection_hints: None,
+                projection_hints_indices: vec![],
                 batch_size: self.batch_size,
                 limit: self.limit,
                 preserve_order: self.preserve_order,
