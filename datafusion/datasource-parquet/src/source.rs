@@ -1206,21 +1206,25 @@ impl ParquetSource {
             false => ObjectStoreUrl::parse(&base_conf.object_store_url)?,
             true => ObjectStoreUrl::local_filesystem(),
         };
-        let store = ctx
-            .task_ctx()
-            .runtime_env()
-            .object_store(object_store_url)?;
-        let metadata_cache = ctx
-            .task_ctx()
-            .runtime_env()
-            .cache_manager
-            .get_file_metadata_cache();
-        let reader_factory =
-            Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
+        // FIXME: @HSTack - we re-register delta object stores AFTER deserialization, so
+        // don't crash here if the object store isn't registered yet.
+        let mut source = if let Ok(store) =
+            ctx.task_ctx().runtime_env().object_store(object_store_url)
+        {
+            let metadata_cache = ctx
+                .task_ctx()
+                .runtime_env()
+                .cache_manager
+                .get_file_metadata_cache();
+            let reader_factory =
+                Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
 
-        let mut source = ParquetSource::new(table_schema)
-            .with_parquet_file_reader_factory(reader_factory)
-            .with_table_parquet_options(options);
+            ParquetSource::new(table_schema)
+                .with_parquet_file_reader_factory(reader_factory)
+                .with_table_parquet_options(options)
+        } else {
+            ParquetSource::new(table_schema).with_table_parquet_options(options)
+        };
 
         if let Some(predicate) = predicate {
             source = source.with_predicate(predicate);
