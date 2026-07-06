@@ -239,6 +239,8 @@ pub(super) struct ParquetMorselizer {
     pub(crate) partition_index: usize,
     /// Projection to apply on top of the table schema (i.e. can reference partition columns).
     pub projection: ProjectionExprs,
+    pub projection_hints: Option<ProjectionExprs>,
+    pub projection_hints_indices: Vec<usize>,
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
@@ -438,6 +440,8 @@ struct PreparedParquetOpen {
     physical_file_schema: SchemaRef,
     output_schema: SchemaRef,
     projection: ProjectionExprs,
+    projection_hints: Option<ProjectionExprs>,
+    projection_hints_indices: Vec<usize>,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Per-scan virtual-column state, Arc-cloned from [`ParquetMorselizer`] so
     /// each file shares validated fields, precomputed null replacements, and
@@ -790,11 +794,19 @@ impl ParquetMorselizer {
         ));
 
         let mut projection = self.projection.clone();
+        let mut projection_hints = self.projection_hints.clone();
         let mut predicate = self.predicate.clone();
         if !literal_columns.is_empty() {
             projection = projection.try_map_exprs(|expr| {
                 replace_columns_with_literals(Arc::clone(&expr), &literal_columns)
             })?;
+            projection_hints = projection_hints
+                .map(|hints| {
+                    hints.try_map_exprs(|expr| {
+                        replace_columns_with_literals(expr, &literal_columns)
+                    })
+                })
+                .transpose()?;
             predicate = predicate
                 .map(|p| replace_columns_with_literals(p, &literal_columns))
                 .transpose()?;
@@ -802,6 +814,9 @@ impl ParquetMorselizer {
 
         // Replace any `input_file_name()` UDFs in the projection with a literal for this file.
         projection = rewrite_input_file_name_in_projection(projection, &file_name)?;
+        projection_hints = projection_hints
+            .map(|hints| rewrite_input_file_name_in_projection(hints, &file_name))
+            .transpose()?;
 
         let predicate_creation_errors = MetricBuilder::new(&self.metrics)
             .with_category(MetricCategory::Rows)
@@ -839,6 +854,8 @@ impl ParquetMorselizer {
             physical_file_schema: logical_file_schema,
             output_schema,
             projection,
+            projection_hints,
+            projection_hints_indices: self.projection_hints_indices.clone(),
             predicate,
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
@@ -1048,6 +1065,14 @@ impl MetadataLoadedParquetOpen {
             prepared.projection = prepared
                 .projection
                 .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
+            prepared.projection_hints = prepared
+                .projection_hints
+                .map(|hints| {
+                    hints.try_map_exprs(|expr| {
+                        simplifier.simplify(rewriter.rewrite(expr)?)
+                    })
+                })
+                .transpose()?;
         }
         prepared.physical_file_schema = Arc::clone(&physical_file_schema);
 
@@ -1433,6 +1458,8 @@ impl RowGroupsPrunedParquetOpen {
             reader_metadata.parquet_schema(),
             &prepared.output_schema,
             prepared.virtual_state.as_deref(),
+            prepared.projection_hints.as_ref(),
+            &prepared.projection_hints_indices,
         )?;
 
         let (decoder, rg_plan, has_row_selection) = {
@@ -2166,6 +2193,8 @@ mod test {
             Ok(ParquetMorselizer {
                 partition_index: self.partition_index,
                 projection,
+                projection_hints: None,
+                projection_hints_indices: vec![],
                 batch_size: self.batch_size,
                 limit: self.limit,
                 preserve_order: self.preserve_order,

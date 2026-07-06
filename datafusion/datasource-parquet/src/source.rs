@@ -305,6 +305,13 @@ pub struct ParquetSource {
     pub(crate) metadata_size_hint: Option<usize>,
     /// Projection to apply to the output.
     pub(crate) projection: ProjectionExprs,
+    /// Complete downstream leaf requirements, expressed against the table schema.
+    /// Set by [`crate::push_all_projection_hints::PushAllProjectionHints`].
+    pub projection_hints: ProjectionExprs,
+    /// Advisory scan output positions contributing to hints, retained for
+    /// compatibility with the original deep-projection serialization.
+    /// Repeated indices are valid; read requirements are resolved by root name.
+    pub projection_hints_indices: Vec<usize>,
     #[cfg(feature = "parquet_encryption")]
     pub(crate) encryption_factory: Option<Arc<dyn EncryptionFactory>>,
     /// If true, the opener flips row-group iteration order. Within-
@@ -340,6 +347,8 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            projection_hints: ProjectionExprs::new(vec![]),
+            projection_hints_indices: vec![],
         }
     }
 
@@ -632,6 +641,8 @@ impl FileSource for ParquetSource {
         Ok(Box::new(ParquetMorselizer {
             partition_index: partition,
             projection: self.projection.clone(),
+            projection_hints: Some(self.projection_hints.clone()),
+            projection_hints_indices: self.projection_hints_indices.clone(),
             batch_size: self
                 .batch_size
                 .expect("Batch size must set before creating ParquetMorselizer"),
@@ -694,6 +705,8 @@ impl FileSource for ParquetSource {
         projection: &ProjectionExprs,
     ) -> datafusion_common::Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
+        source.projection_hints = ProjectionExprs::new([]);
+        source.projection_hints_indices.clear();
 
         // If there's no reference to `FileRowIndexFunc` in the projection, we can just merge
         // both projections as-is, there's no need to modify the projection first.
