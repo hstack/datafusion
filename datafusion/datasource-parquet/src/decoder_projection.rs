@@ -44,6 +44,9 @@ use datafusion_physical_expr_adapter::replace_columns_with_literals;
 use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 
+use crate::leaves::{
+    build_deep_projection_read_plan, restore_pruned_batch, restrict_to_base_projection,
+};
 use crate::opener::{VirtualColumnsState, append_fields};
 use crate::projection_read_plan::build_projection_read_plan;
 
@@ -63,6 +66,7 @@ pub(crate) struct DecoderProjection {
     /// in metadata / nullability and [`map`](Self::map) must rebuild the batch
     /// with `output_schema`.
     replace_schema: bool,
+    restore_schema: Option<SchemaRef>,
 }
 
 impl DecoderProjection {
@@ -84,6 +88,8 @@ impl DecoderProjection {
         parquet_schema: &SchemaDescriptor,
         output_schema: &SchemaRef,
         virtual_state: Option<&VirtualColumnsState>,
+        projection_hints: Option<&ProjectionExprs>,
+        _projection_hints_indices: &[usize],
     ) -> Result<Self> {
         // Virtual columns are produced by the reader separately from the
         // projection mask, so strip them from the expressions we feed into
@@ -97,7 +103,7 @@ impl DecoderProjection {
                 replace_columns_with_literals(expr, state.null_replacements())
             })?,
         };
-        let read_plan = build_projection_read_plan(
+        let mut read_plan = build_projection_read_plan(
             projection_for_read_plan.expr_iter(),
             physical_file_schema,
             parquet_schema,
@@ -112,6 +118,29 @@ impl DecoderProjection {
             }
             None => Arc::clone(&read_plan.projected_schema),
         };
+        let mut restore_schema = None;
+        if let Some(hints) = projection_hints
+            && !hints.as_ref().is_empty()
+        {
+            let hints = match virtual_state {
+                Some(state) => hints.clone().try_map_exprs(|expr| {
+                    replace_columns_with_literals(expr, state.null_replacements())
+                })?,
+                None => hints.clone(),
+            };
+            let hinted = build_deep_projection_read_plan(
+                hints.expr_iter(),
+                physical_file_schema,
+                parquet_schema,
+            )?;
+            read_plan = restrict_to_base_projection(
+                &read_plan,
+                &hinted,
+                physical_file_schema,
+                parquet_schema,
+            )?;
+            restore_schema = Some(Arc::clone(&stream_schema));
+        }
 
         // Rebase the projection onto the decoder's stream schema (column
         // indices change because the decoder yields only the masked columns).
@@ -130,6 +159,7 @@ impl DecoderProjection {
             projector,
             output_schema: Arc::clone(output_schema),
             replace_schema,
+            restore_schema,
         })
     }
 
@@ -146,6 +176,14 @@ impl DecoderProjection {
     /// the data has no nulls; some logical schemas carry field-level metadata
     /// the file schema does not).
     pub(crate) fn map(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let restored;
+        let batch = match &self.restore_schema {
+            Some(schema) if batch.schema() != *schema => {
+                restored = restore_pruned_batch(batch, schema)?;
+                &restored
+            }
+            _ => batch,
+        };
         let projected = self.projector.project_batch(batch)?;
         if !self.replace_schema {
             return Ok(projected);
