@@ -63,6 +63,8 @@ mod tracing;
 /// Run all tests that are found in the `extension_types` directory
 mod extension_types;
 
+mod optimizer_deep_indices;
+
 #[cfg(test)]
 #[ctor::ctor(unsafe)]
 fn init() {
