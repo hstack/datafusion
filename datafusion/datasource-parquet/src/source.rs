@@ -1236,21 +1236,17 @@ impl ParquetSource {
             false => ObjectStoreUrl::parse(&base_conf.object_store_url)?,
             true => ObjectStoreUrl::local_filesystem(),
         };
-        let store = ctx
-            .task_ctx()
-            .runtime_env()
-            .object_store(object_store_url)?;
-        let metadata_cache = ctx
-            .task_ctx()
-            .runtime_env()
-            .cache_manager
-            .get_file_metadata_cache();
-        let reader_factory =
-            Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
-
-        let mut source = ParquetSource::new(table_schema)
-            .with_parquet_file_reader_factory(reader_factory)
-            .with_table_parquet_options(options);
+        let runtime_env = ctx.task_ctx().runtime_env();
+        let mut source =
+            ParquetSource::new(table_schema).with_table_parquet_options(options);
+        // HSTACK: object stores may be registered after the plan is decoded.
+        // Without a store, execution falls back to the default reader factory.
+        if let Ok(store) = runtime_env.object_store(object_store_url) {
+            let metadata_cache = runtime_env.cache_manager.get_file_metadata_cache();
+            source = source.with_parquet_file_reader_factory(Arc::new(
+                CachedParquetFileReaderFactory::new(store, metadata_cache),
+            ));
+        }
 
         if let Some(predicate) = predicate {
             source = source.with_predicate(predicate);

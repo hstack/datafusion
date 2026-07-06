@@ -157,6 +157,44 @@ fn roundtrip_parquet_exec_attaches_cached_reader_factory_after_roundtrip() -> Re
 }
 
 #[test]
+fn roundtrip_parquet_exec_with_unregistered_object_store() -> Result<()> {
+    let file_schema =
+        Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
+    let file_source = Arc::new(ParquetSource::new(Arc::clone(&file_schema)));
+    let scan_config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::parse("s3://unregistered-bucket")?,
+        file_source,
+    )
+    .with_file_groups(vec![FileGroup::new(vec![PartitionedFile::new(
+        "path/to/file.parquet".to_string(),
+        1024,
+    )])])
+    .build();
+    let exec_plan = DataSourceExec::from_data_source(scan_config);
+
+    // The store is registered by the caller after decoding.
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DefaultPhysicalProtoConverter {};
+    let roundtripped =
+        roundtrip_test_and_return(exec_plan, &ctx, &codec, &proto_converter)?;
+
+    let parquet_source = roundtripped
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+        .and_then(|scan| scan.file_source().downcast_ref::<ParquetSource>())
+        .ok_or_else(|| {
+            internal_datafusion_err!("Expected Parquet scan after roundtrip")
+        })?;
+
+    assert!(
+        parquet_source.parquet_file_reader_factory().is_none(),
+        "Execution should use the default reader factory once the store is registered"
+    );
+    Ok(())
+}
+
+#[test]
 fn roundtrip_arrow_scan() -> Result<()> {
     let file_schema =
         Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
