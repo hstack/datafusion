@@ -45,6 +45,7 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
 
 use datafusion_common::{DataFusionError, Result};
+use datafusion_common::deep::cast_record_batch;
 use datafusion_physical_expr::projection::Projector;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Gauge};
 
@@ -114,6 +115,7 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) remaining_limit: Option<usize>,
     pub(crate) reader: Box<dyn AsyncFileReader>,
     pub(crate) projector: Projector,
+    pub(crate) stream_schema: Option<Arc<Schema>>,
     pub(crate) output_schema: Arc<Schema>,
     pub(crate) replace_schema: bool,
     pub(crate) arrow_reader_metrics: ArrowReaderMetrics,
@@ -168,7 +170,7 @@ impl PushDecoderStreamState {
                     }
                 }
                 Ok(DecodeResult::Data(batch)) => {
-                    let batch = if let Some(remaining_limit) = self.remaining_limit {
+                    let mut batch = if let Some(remaining_limit) = self.remaining_limit {
                         if batch.num_rows() > remaining_limit {
                             self.remaining_limit = Some(0);
                             batch.slice(0, remaining_limit)
@@ -182,7 +184,22 @@ impl PushDecoderStreamState {
                     };
                     let mut timer = self.baseline_metrics.elapsed_compute().timer();
                     self.copy_arrow_reader_metrics();
-                    let result = self.project_batch(&batch);
+
+                    let batch = if let Some(ref stream_schema) = self.stream_schema
+                        && !stream_schema.fields().is_empty()
+                        && batch.schema() != *stream_schema
+                    {
+                        cast_record_batch(
+                            &batch,
+                            stream_schema.clone(),
+                            false,
+                            true,
+                        )
+                    } else {
+                        Ok(batch)
+                    };
+
+                    let result = batch.and_then(|batch| self.project_batch(&batch));
                     timer.stop();
                     // Release the borrow on baseline_metrics before moving self
                     drop(timer);

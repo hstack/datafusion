@@ -2013,6 +2013,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-expr-adapter",
  "datafusion-physical-expr-common",
+ "datafusion-physical-optimizer",
  "datafusion-physical-plan",
  "datafusion-pruning",
  "datafusion-session",
@@ -2405,6 +2406,7 @@ dependencies = [
  "datafusion-pruning",
  "insta",
  "itertools 0.14.0",
+ "log",
  "recursive",
  "tokio",
 ]
