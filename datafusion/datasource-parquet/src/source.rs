@@ -288,6 +288,8 @@ pub struct ParquetSource {
     pub(crate) metadata_size_hint: Option<usize>,
     /// Projection to apply to the output.
     pub(crate) projection: ProjectionExprs,
+    pub projection_hints: ProjectionExprs,
+    pub projection_hints_indices: Vec<usize>,
     #[cfg(feature = "parquet_encryption")]
     pub(crate) encryption_factory: Option<Arc<dyn EncryptionFactory>>,
     /// If true, the opener flips row-group iteration order. Within-
@@ -323,6 +325,8 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            projection_hints: ProjectionExprs::new(vec![]),
+            projection_hints_indices: vec![],
         }
     }
 
@@ -587,6 +591,8 @@ impl FileSource for ParquetSource {
         Ok(Box::new(ParquetMorselizer {
             partition_index: partition,
             projection: self.projection.clone(),
+            projection_hints: Some(self.projection_hints.clone()),
+            projection_hints_indices: self.projection_hints_indices.clone(),
             batch_size: self
                 .batch_size
                 .expect("Batch size must set before creating ParquetMorselizer"),
