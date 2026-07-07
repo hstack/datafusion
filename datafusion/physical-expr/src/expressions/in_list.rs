@@ -34,6 +34,7 @@ use arrow::datatypes::*;
 use datafusion_common::{
     DFSchema, Result, ScalarValue, assert_or_internal_err, exec_err,
 };
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_expr::{ColumnarValue, expr_vec_fmt};
 
 mod array_static_filter;
@@ -43,6 +44,7 @@ mod strategy;
 
 use static_filter::StaticFilter;
 use strategy::instantiate_static_filter;
+use crate::expressions::Column;
 
 /// InList
 pub struct InListExpr {
@@ -231,8 +233,24 @@ impl InListExpr {
         negated: bool,
         schema: &Schema,
     ) -> Result<Self> {
+        // @HStack - temporary fix
+        // possibly rewrite the column indices !!!
+        let new_expr = expr.clone().transform(|e| {
+            if let Some(column) = e.downcast_ref::<Column>() {
+                let column_name = column.name();
+                return if let Ok(new_index) = schema.index_of(column_name) {
+                    Ok(Transformed::yes(Arc::new(Column::new(column_name, new_index)) as Arc<dyn PhysicalExpr>))
+                } else {
+                    Ok(Transformed::no(e))
+                }
+            }
+            Ok(Transformed::no(e))
+        })
+            .data()?;
+
+
         // Check the data types match
-        let expr_data_type = expr.data_type(schema)?;
+        let expr_data_type = new_expr.data_type(schema)?;
         for list_expr in list.iter() {
             let list_expr_data_type = list_expr.data_type(schema)?;
             assert_inlist_data_types_match(&expr_data_type, &list_expr_data_type)?;
