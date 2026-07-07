@@ -31,6 +31,7 @@ use arrow::compute::kernels::boolean::{not, or_kleene};
 use arrow::compute::kernels::cmp::eq as arrow_eq;
 use arrow::datatypes::*;
 
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
     DFSchema, Result, ScalarValue, assert_or_internal_err, exec_err,
 };
@@ -43,6 +44,7 @@ mod result;
 mod static_filter;
 mod strategy;
 
+use crate::expressions::Column;
 use static_filter::StaticFilter;
 use strategy::instantiate_static_filter;
 
@@ -233,8 +235,27 @@ impl InListExpr {
         negated: bool,
         schema: &Schema,
     ) -> Result<Self> {
+        // @HStack - temporary fix
+        // possibly rewrite the column indices !!!
+        let new_expr = Arc::clone(&expr)
+            .transform(|e| {
+                if let Some(column) = e.downcast_ref::<Column>() {
+                    let column_name = column.name();
+                    return if let Ok(new_index) = schema.index_of(column_name) {
+                        Ok(Transformed::yes(
+                            Arc::new(Column::new(column_name, new_index))
+                                as Arc<dyn PhysicalExpr>,
+                        ))
+                    } else {
+                        Ok(Transformed::no(e))
+                    };
+                }
+                Ok(Transformed::no(e))
+            })
+            .data()?;
+
         // Check the data types match
-        let expr_data_type = expr.data_type(schema)?;
+        let expr_data_type = new_expr.data_type(schema)?;
         for list_expr in list.iter() {
             let list_expr_data_type = list_expr.data_type(schema)?;
             assert_inlist_data_types_match(&expr_data_type, &list_expr_data_type)?;
@@ -3863,6 +3884,33 @@ mod tests {
             result,
             &BooleanArray::from(vec![Some(false), Some(true), None, Some(false)])
         );
+
+        Ok(())
+    }
+
+    /// Regression test: `DataSourceExec` can apply filters against both the
+    /// output and the physical file schema, so an `InListExpr`'s `Column`
+    /// index can be stale relative to the schema it's rebuilt against (e.g.
+    /// after a physical-plan proto round-trip). Without rewriting the index
+    /// by name before the data-type check, `try_new` would compare the list
+    /// literal's type against whatever column the stale index happens to
+    /// land on in `schema` and (as here) reject the construction outright.
+    #[test]
+    fn test_try_new_rewrites_stale_column_index() -> Result<()> {
+        // `schema` places "b" (Utf8) at index 0 and "a" (Int32) at index 1 --
+        // the reverse of the schema the stale `Column("a", 0)` was built
+        // against -- so index 0 now resolves to the wrong (and
+        // type-incompatible) column unless the index is rewritten by name.
+        let schema = Schema::new(vec![
+            Field::new("b", DataType::Utf8, true),
+            Field::new("a", DataType::Int32, true),
+        ]);
+        let stale_col_a = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+
+        // Without the by-name rewrite, this would fail data-type validation:
+        // index 0 is Utf8 in `schema`, but the list literal is Int32.
+        let expr = InListExpr::try_new(stale_col_a, vec![lit(2)], false, &schema)?;
+        assert!(!expr.negated());
 
         Ok(())
     }
