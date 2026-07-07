@@ -904,6 +904,7 @@ impl protobuf::PhysicalPlanNode {
 
             // Check if there's a projection and use projected schema for predicate parsing
             let base_conf = scan.base_conf.as_ref().unwrap();
+            // FIXME this is NOT EVER USED
             let predicate_schema = if !base_conf.projection.is_empty() {
                 // Create projected schema for parsing the predicate
                 let projected_fields: Vec<_> = base_conf
@@ -912,6 +913,31 @@ impl protobuf::PhysicalPlanNode {
                     .map(|&i| schema.field(i as usize).clone())
                     .collect();
                 Arc::new(Schema::new(projected_fields))
+            } else if let Some(proto_projection_exprs) = &base_conf.projection_exprs {
+                let projection_exprs: Vec<ProjectionExpr> = proto_projection_exprs
+                    .projections
+                    .iter()
+                    .map(|proto_expr| {
+                        let expr = proto_converter.proto_to_physical_expr(
+                            proto_expr.expr.as_ref().ok_or_else(|| {
+                                internal_datafusion_err!("ProjectionExpr missing expr field")
+                            })?,
+                            &schema,
+                            ctx,
+                        )?;
+                        Ok(ProjectionExpr::new(expr, proto_expr.alias.clone()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let projection_exprs = ProjectionExprs::new(projection_exprs);
+                let projected_fields = projection_exprs
+                    .column_indices()
+                    .iter()
+                    .map(|&i| schema.field(i as usize).clone())
+                    .collect::<Vec<_>>();
+                let predicate_schema = Arc::new(Schema::new(projected_fields));
+                // @HStack DISABLED for now - if we want to actually have a projection,
+                schema.clone()
             } else {
                 schema.clone()
             };
@@ -955,9 +981,9 @@ impl protobuf::PhysicalPlanNode {
             //     .with_parquet_file_reader_factory(reader_factory)
             //     .with_table_parquet_options(options);
             // FIXME: @HSTack - we re-register delta object stores AFTER deserialization
-            let mut source = if let Ok(store) = ctx.runtime_env().object_store(object_store_url) {
+            let mut source = if let Ok(store) = ctx.task_ctx.runtime_env().object_store(object_store_url) {
                 let metadata_cache =
-                    ctx.runtime_env().cache_manager.get_file_metadata_cache();
+                    ctx.task_ctx.runtime_env().cache_manager.get_file_metadata_cache();
                 let reader_factory =
                     Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
 
@@ -982,9 +1008,8 @@ impl protobuf::PhysicalPlanNode {
                             proto_expr.expr.as_ref().ok_or_else(|| {
                                 internal_datafusion_err!("ProjectionExpr missing expr field")
                             })?,
-                            ctx,
                             &schema.clone(),
-                            codec,
+                            ctx,
                         )?;
                         Ok(ProjectionExpr::new(expr, proto_expr.alias.clone()))
                     })
