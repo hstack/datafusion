@@ -923,4 +923,145 @@ mod tests {
         assert!(source.reverse_row_groups());
         assert!(source.filter().is_some());
     }
+
+    /// Reproduces a crash where `Display`ing a plan (as `EXPLAIN` or any logging
+    /// code would) panics inside `ParquetSource::fmt_extra`.
+    ///
+    /// The scenario: two parquet-backed tables share a leading struct-typed column
+    /// (e.g. an audit/system column) followed by a join key of the same name on
+    /// both sides. A join's filter-pushdown/inference can produce, for one side, a
+    /// filter whose `Column` has the right *name* but an index that only matches
+    /// the *other* side's schema layout - here, index 0, which is `meta` (a
+    /// struct) on this side, not `MERGE_POLICY_ID`. `fmt_extra` used to build a
+    /// `PruningPredicate` straight from that mismatched `Column` and panic
+    /// comparing `Struct(..) = Float64`.
+    #[tokio::test]
+    async fn test_display_does_not_panic_on_predicate_with_mismatched_column_index() {
+        use arrow::array::{ArrayRef, Float64Array, StringArray, StructArray};
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use arrow::record_batch::RecordBatch;
+        use bytes::{BufMut, BytesMut};
+        use datafusion_common::{JoinType, NullEquality};
+        use datafusion_datasource::PartitionedFile;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, binary, lit};
+        use datafusion_physical_plan::displayable;
+        use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
+        use datafusion_physical_plan::ExecutionPlan;
+        use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
+        use parquet::arrow::ArrowWriter;
+
+        let struct_field = Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        );
+        let key_field = Field::new("MERGE_POLICY_ID", DataType::Float64, true);
+        let schema = Arc::new(Schema::new(vec![struct_field, key_field]));
+
+        let make_batch = |ids: Vec<f64>| -> RecordBatch {
+            let meta_id_field = Arc::new(Field::new("id", DataType::Utf8, true));
+            let meta_ids: ArrayRef =
+                Arc::new(StringArray::from(vec!["a".to_string(); ids.len()]));
+            let meta: ArrayRef = Arc::new(StructArray::from(vec![(meta_id_field, meta_ids)]));
+            let keys: ArrayRef = Arc::new(Float64Array::from(ids));
+            RecordBatch::try_new(Arc::clone(&schema), vec![meta, keys]).unwrap()
+        };
+
+        async fn write_parquet(
+            store: Arc<dyn ObjectStore>,
+            filename: &str,
+            batch: RecordBatch,
+        ) -> u64 {
+            let mut out = BytesMut::new().writer();
+            {
+                let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), None).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+            let data = out.into_inner().freeze();
+            let len = data.len() as u64;
+            store.put(&Path::from(filename), data.into()).await.unwrap();
+            len
+        }
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let left_len = write_parquet(Arc::clone(&store), "left.parquet", make_batch(vec![42.0])).await;
+        let right_len =
+            write_parquet(Arc::clone(&store), "right.parquet", make_batch(vec![42.0])).await;
+        let object_store_url = ObjectStoreUrl::local_filesystem();
+
+        // Left side: the literal `WHERE MERGE_POLICY_ID = 42`, correctly indexed (1).
+        let left_predicate = binary(
+            Arc::new(Column::new("MERGE_POLICY_ID", 1)),
+            Operator::Eq,
+            lit(42.0f64),
+            &schema,
+        )
+        .unwrap();
+        let left_source =
+            Arc::new(ParquetSource::new(Arc::clone(&schema)).with_predicate(left_predicate));
+        let left_config = FileScanConfigBuilder::new(object_store_url.clone(), left_source)
+            .with_file(PartitionedFile::new("left.parquet", left_len))
+            .build();
+        let left_exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(left_config);
+
+        // Right side: what a join's transitive-filter inference produces from
+        // `L.MERGE_POLICY_ID = R.MERGE_POLICY_ID AND L.MERGE_POLICY_ID = 42` - same
+        // column name, but index 0, which is only valid for `L`'s layout (here it
+        // means `meta`, a struct, on `R`'s own schema).
+        let right_predicate = binary(
+            Arc::new(Column::new("MERGE_POLICY_ID", 0)),
+            Operator::Eq,
+            lit(42.0f64),
+            &schema,
+        )
+        .unwrap();
+        // Wrapping in a `DynamicFilterPhysicalExpr` matches the real bug shape (the
+        // predicate carried a join-side dynamic filter alongside the mismatched
+        // comparison) and is what makes `PruningPredicate::try_new` take the
+        // snapshot path that runs the vulnerable, unrewritten simplifier pass.
+        let right_predicate = Arc::new(DynamicFilterPhysicalExpr::new(
+            right_predicate.children().into_iter().map(Arc::clone).collect(),
+            right_predicate,
+        )) as Arc<dyn PhysicalExpr>;
+        let right_source =
+            Arc::new(ParquetSource::new(Arc::clone(&schema)).with_predicate(right_predicate));
+        let right_config = FileScanConfigBuilder::new(object_store_url, right_source)
+            .with_file(PartitionedFile::new("right.parquet", right_len))
+            .build();
+        let right_exec: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(right_config);
+
+        let on = vec![(
+            Arc::new(Column::new("MERGE_POLICY_ID", 1)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("MERGE_POLICY_ID", 1)) as Arc<dyn PhysicalExpr>,
+        )];
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                left_exec,
+                right_exec,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+
+        // This must not panic: Displaying the plan (as EXPLAIN, logging, or any
+        // bookkeeping code would) used to crash inside `ParquetSource::fmt_extra`
+        // while building a pruning predicate from the right side's mismatched
+        // `Column`.
+        let _ = displayable(join.as_ref()).indent(true).to_string();
+    }
 }
