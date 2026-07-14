@@ -1100,6 +1100,10 @@ pub(crate) fn build_pruning_predicates(
     let Some(predicate) = predicate.as_ref() else {
         return (None, None);
     };
+    // Column indices may not match file_schema (e.g. filters inferred across a
+    // join keep the other side's index); reassign by name before use.
+    let predicate = &reassign_expr_columns(Arc::clone(predicate), file_schema.as_ref())
+        .unwrap_or_else(|_| Arc::clone(predicate));
     let pruning_predicate = build_pruning_predicate(
         Arc::clone(predicate),
         file_schema,
