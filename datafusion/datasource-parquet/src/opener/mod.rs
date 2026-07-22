@@ -59,6 +59,7 @@ use datafusion_common::{
 use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterTracking};
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
+use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -1730,11 +1731,15 @@ pub(crate) fn build_pruning_predicates(
     max_in_list_size: usize,
 ) -> Option<Arc<PruningPredicate>> {
     let predicate = predicate.as_ref()?;
+    // Column indices can be stale (e.g. inferred from the other side of a
+    // join), so resolve them by name against the file schema.
+    let predicate = reassign_expr_columns(Arc::clone(predicate), file_schema.as_ref())
+        .unwrap_or_else(|_| Arc::clone(predicate));
     PruningPredicateBuilder::new()
         .with_file_schema(Arc::clone(file_schema))
         .with_error_counter(predicate_creation_errors)
         .with_max_in_list_size(max_in_list_size)
-        .build(Arc::clone(predicate))
+        .build(predicate)
 }
 
 /// Returns a `ArrowReaderMetadata` with the page index loaded, loading
