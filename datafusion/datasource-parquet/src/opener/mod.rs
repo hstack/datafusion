@@ -1492,6 +1492,9 @@ pub(crate) fn build_pruning_predicates(
     predicate_creation_errors: &Count,
 ) -> Option<Arc<PruningPredicate>> {
     let predicate = predicate.as_ref()?;
+    let predicate = &reassign_expr_columns(Arc::clone(predicate), file_schema.as_ref())
+        .unwrap_or_else(|_| Arc::clone(predicate));
+
     build_pruning_predicate(
         Arc::clone(predicate),
         file_schema,
