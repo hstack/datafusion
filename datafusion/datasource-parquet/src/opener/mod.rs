@@ -40,6 +40,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
 use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner, Morselizer};
 use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
 use datafusion_physical_expr_adapter::rewrite::rewrite_input_file_name_in_projection;
 use std::collections::{HashMap, VecDeque};
@@ -1719,6 +1720,9 @@ pub(crate) fn build_pruning_predicates(
     max_in_list_size: usize,
 ) -> Option<Arc<PruningPredicate>> {
     let predicate = predicate.as_ref()?;
+    let predicate = &reassign_expr_columns(Arc::clone(predicate), file_schema.as_ref())
+        .unwrap_or_else(|_| Arc::clone(predicate));
+
     PruningPredicateBuilder::new()
         .with_file_schema(Arc::clone(file_schema))
         .with_error_counter(predicate_creation_errors)
