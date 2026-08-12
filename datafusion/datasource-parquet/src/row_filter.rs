@@ -85,7 +85,7 @@ use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
-
+use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_plan::metrics;
 
 use super::ParquetFileMetrics;
@@ -420,7 +420,32 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
         {
             let args = func.args();
 
-            if let Some(column) = args.first().and_then(|a| a.downcast_ref::<Column>()) {
+            // @HStack - try harder to find the first column parameter
+            // for safety - only handle what we KNOW by the `fmt_sql`
+            let first_arg_column = args.first().and_then(|a| {
+                if let Some(col) = a.downcast_ref::<Column>() {
+                    Some(col)
+                } else {
+                    // HACK - check if cast by string
+                    let tmp = fmt_sql(a.as_ref()).to_string();
+                    if tmp.contains("CAST") {
+                        let children = a.children();
+                        if children.len() == 1 {
+                            if let Some(col) = children[0].downcast_ref::<Column>() {
+                                Some(col)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            });
+
+            if let Some(column) = first_arg_column {
                 // for Map columns, get_field performs a runtime key lookup rather than a
                 // schema-level field access so the entire Map column must be read,
                 // we skip the struct field optimization and defer to normal Column traversal
