@@ -66,8 +66,9 @@
 //! The clip is *total*: any type shape it does not understand (maps,
 //! dictionaries, wrapper-kind mismatches, ...) keeps all of its leaves, so
 //! the worst case is today's behavior of reading the full column. Map values
-//! are deliberately not clipped: the runtime cast routes maps through Arrow's
-//! positional struct cast, which requires all children to be present. Nor are
+//! are deliberately not clipped here. Recursive map casting matches struct
+//! fields by name, but clipping must also preserve complete keys and the map
+//! entry layout. Nor are
 //! `ListView`/`LargeListView`/`Dictionary` wrappers clipped here, even though
 //! `cast_column` does recurse through them by name. That is a conservative
 //! choice (safe, since the worst case is still just a full read) left as a

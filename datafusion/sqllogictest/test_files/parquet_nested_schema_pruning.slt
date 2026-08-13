@@ -361,9 +361,8 @@ statement ok
 DROP TABLE two_level_full;
 
 ##########
-# A MAP column is never clipped (the runtime cast routes maps through Arrow's
-# positional struct cast, which needs every child), but it must not stop a
-# struct sibling from being clipped. The declared schema below omits the map
+# A MAP column is not clipped by this reader, but it must not stop a struct
+# sibling from being clipped. The declared schema below omits the map
 # entirely, leaving it in the file as an unprojected root.
 ##########
 
