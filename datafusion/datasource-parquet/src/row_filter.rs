@@ -82,10 +82,9 @@ use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::expressions::{CastExpr, Column, Literal, TryCastExpr};
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
-use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_plan::metrics;
 
 use super::ParquetFileMetrics;
@@ -391,6 +390,27 @@ impl<'schema> PushdownChecker<'schema> {
     }
 }
 
+/// Recover the struct root [`Column`] that a `get_field` first argument reads,
+/// looking through a single schema-adaptation [`CastExpr`]/[`TryCastExpr`].
+///
+/// The physical expression adapter may wrap a struct column in a cast to evolve
+/// nested field types (e.g. `Utf8` -> `Utf8View`). The struct-field pushdown
+/// optimization still applies because the cast preserves the struct's field
+/// layout, so we see through it to find the underlying column.
+fn get_field_struct_root(expr: &Arc<dyn PhysicalExpr>) -> Option<&Column> {
+    if let Some(column) = expr.downcast_ref::<Column>() {
+        return Some(column);
+    }
+    let cast_input = if let Some(cast) = expr.downcast_ref::<CastExpr>() {
+        cast.expr()
+    } else if let Some(try_cast) = expr.downcast_ref::<TryCastExpr>() {
+        try_cast.expr()
+    } else {
+        return None;
+    };
+    cast_input.downcast_ref::<Column>()
+}
+
 impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
     type Node = Arc<dyn PhysicalExpr>;
 
@@ -420,30 +440,12 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
         {
             let args = func.args();
 
-            // @HStack - try harder to find the first column parameter
-            // for safety - only handle what we KNOW by the `fmt_sql`
-            let first_arg_column = args.first().and_then(|a| {
-                if let Some(col) = a.downcast_ref::<Column>() {
-                    Some(col)
-                } else {
-                    // HACK - check if cast by string
-                    let tmp = fmt_sql(a.as_ref()).to_string();
-                    if tmp.contains("CAST") {
-                        let children = a.children();
-                        if children.len() == 1 {
-                            if let Some(col) = children[0].downcast_ref::<Column>() {
-                                Some(col)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-            });
+            // The physical expression adapter may wrap the struct root column in a
+            // schema-adaptation cast (e.g. Utf8 -> Utf8View on a nested field). The
+            // struct-field pushdown optimization still applies, so look through a
+            // single cast when recovering the struct column.
+            let first_arg_column =
+                args.first().and_then(|a| get_field_struct_root(a));
 
             if let Some(column) = first_arg_column {
                 // for Map columns, get_field performs a runtime key lookup rather than a
@@ -1717,6 +1719,50 @@ mod test {
         let expr = logical2physical(&expr, &table_schema);
 
         assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
+    }
+
+    /// A schema-adaptation cast wrapping the struct root column (e.g. when a
+    /// nested field is stored as Utf8 but the table type is Utf8View) must not
+    /// defeat the struct-field pushdown optimization.
+    #[test]
+    fn get_field_on_cast_wrapped_struct_allows_pushdown() {
+        // File schema: struct_col: Struct<a: Utf8>
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "struct_col",
+            DataType::Struct(
+                vec![Arc::new(Field::new("a", DataType::Utf8, true))].into(),
+            ),
+            true,
+        )]));
+        // Table schema evolves the leaf to Utf8View, forcing the expr adapter to
+        // wrap `struct_col` in a CastExpr.
+        let table_schema = Arc::new(Schema::new(vec![Field::new(
+            "struct_col",
+            DataType::Struct(
+                vec![Arc::new(Field::new("a", DataType::Utf8View, true))].into(),
+            ),
+            true,
+        )]));
+
+        // get_field(struct_col, 'a') = 'x'
+        let get_field_expr = get_field().call(vec![
+            col("struct_col"),
+            Expr::Literal(ScalarValue::Utf8(Some("a".to_string())), None),
+        ]);
+        let expr = get_field_expr.eq(Expr::Literal(
+            ScalarValue::Utf8View(Some("x".to_string())),
+            None,
+        ));
+        let expr = logical2physical(&expr, &table_schema);
+
+        // Adapt to the file schema: wraps struct_col in CAST(.. AS Struct<a: Utf8View>).
+        let expr = DefaultPhysicalExprAdapterFactory {}
+            .create(table_schema, Arc::clone(&file_schema))
+            .expect("creating expr adapter")
+            .rewrite(expr)
+            .expect("rewriting expression");
+
+        assert!(can_expr_be_pushed_down_with_schemas(&expr, &file_schema));
     }
 
     /// get_field on a struct field that resolves to a nested type should still block pushdown.
