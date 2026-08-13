@@ -19,16 +19,19 @@ use crate::error::{_plan_err, Result};
 use arrow::{
     array::{
         Array, ArrayRef, AsArray, DictionaryArray, FixedSizeListArray, GenericListArray,
-        GenericListViewArray, RecordBatch, StructArray, UnionArray, downcast_integer,
-        make_array, new_null_array,
+        GenericListViewArray, MapArray, RecordBatch, StructArray, UInt64Array,
+        UnionArray, downcast_integer, make_array, new_null_array,
     },
     buffer::NullBuffer,
-    compute::{CastOptions, can_cast_types, cast_with_options},
+    compute::{CastOptions, can_cast_types, cast_with_options, take},
     datatypes::{
         DataType, DataType::Struct, Field, FieldRef, SchemaRef, UnionFields, UnionMode,
     },
 };
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 /// Cast a struct column to match target struct fields, handling nested structs recursively.
 ///
@@ -185,9 +188,11 @@ fn cast_union_column(
 ///
 /// This function serves as the main entry point for column casting operations. For struct
 /// types, it enforces that **only struct columns can be cast to struct types**.
+/// When the source and target types match, it returns the original array.
 ///
 /// ## Casting Behavior
 /// - **Struct Types**: Delegates to `cast_struct_column` for struct-to-struct casting only
+/// - Map types with nested structs: Matches struct fields within keys and values by name
 /// - **Non-Struct Types**: Uses Arrow's standard `cast` function for primitive type conversions
 ///
 /// ## Cast Options
@@ -232,6 +237,7 @@ fn cast_union_column(
 /// # Errors
 /// Returns an error if:
 /// - Attempting to cast a non-struct column to a struct type
+/// - A map has invalid entries or requires an unsafe key change
 /// - Arrow's cast function fails for non-struct types
 /// - Memory allocation fails during struct construction
 /// - Invalid data type combinations are encountered
@@ -240,6 +246,10 @@ pub fn cast_column(
     target_type: &DataType,
     cast_options: &CastOptions,
 ) -> Result<ArrayRef> {
+    if source_col.data_type() == target_type {
+        return Ok(Arc::clone(source_col));
+    }
+
     match (source_col.data_type(), target_type) {
         (_, Struct(target_fields)) => {
             cast_struct_column(source_col, target_fields, cast_options)
@@ -264,6 +274,16 @@ pub fn cast_column(
         }
         (DataType::LargeListView(_), DataType::LargeListView(target_inner)) => {
             cast_list_view_column::<i64>(source_col, target_inner, cast_options)
+        }
+        (DataType::Map(_, _), DataType::Map(target_entries, target_sorted))
+            if requires_nested_struct_cast(source_col.data_type(), target_type) =>
+        {
+            cast_map_column(
+                source_col.as_map(),
+                target_entries,
+                *target_sorted,
+                cast_options,
+            )
         }
         (
             DataType::Dictionary(source_key_type, _),
@@ -409,6 +429,59 @@ fn mask_array_values(
     Ok(make_array(
         values.to_data().into_builder().nulls(nulls).build()?,
     ))
+}
+
+fn cast_map_column(
+    source_map: &MapArray,
+    target_entries: &FieldRef,
+    target_sorted: bool,
+    cast_options: &CastOptions,
+) -> Result<ArrayRef> {
+    let DataType::Map(source_entries, source_sorted) = source_map.data_type() else {
+        unreachable!("MapArray data type must be Map")
+    };
+    let (target_key, target_value) = validate_map_compatibility(
+        source_entries,
+        *source_sorted,
+        target_entries,
+        target_sorted,
+    )?;
+
+    // Exclude entries hidden by null rows or outside a sliced map before casting.
+    let offsets = source_map.value_offsets();
+    let has_unreachable_entries = offsets[0] != 0
+        || offsets[offsets.len() - 1] as usize != source_map.entries().len();
+    let compacted_map = if has_unreachable_entries
+        || source_map.offsets().has_non_empty_nulls(source_map.nulls())
+    {
+        let indices = UInt64Array::from_iter_values(0..source_map.len() as u64);
+        Some(take(source_map, &indices, None)?.as_map().clone())
+    } else {
+        None
+    };
+    let source_map = compacted_map.as_ref().unwrap_or(source_map);
+
+    let cast_keys = cast_column(source_map.keys(), target_key.data_type(), cast_options)
+        .map_err(|error| error.context("While casting map keys"))?;
+    if cast_keys.null_count() != 0 {
+        return _plan_err!("Cannot cast map keys: cast produced null keys");
+    }
+    let cast_values =
+        cast_column(source_map.values(), target_value.data_type(), cast_options)
+            .map_err(|error| error.context("While casting map values"))?;
+    let Struct(target_fields) = target_entries.data_type() else {
+        unreachable!("Validated map entries must be a struct")
+    };
+    let entries =
+        StructArray::try_new(target_fields.clone(), vec![cast_keys, cast_values], None)?;
+
+    Ok(Arc::new(MapArray::try_new(
+        Arc::clone(target_entries),
+        source_map.offsets().clone(),
+        entries,
+        source_map.nulls().cloned(),
+        target_sorted,
+    )?))
 }
 
 fn cast_dictionary_column(
@@ -561,6 +634,147 @@ fn validate_field_compatibility(
     )
 }
 
+fn validate_map_compatibility<'a>(
+    source_entries: &Field,
+    source_sorted: bool,
+    target_entries: &'a Field,
+    target_sorted: bool,
+) -> Result<(&'a FieldRef, &'a FieldRef)> {
+    if source_sorted != target_sorted {
+        return _plan_err!("Cannot change map sorted flag during schema adaptation");
+    }
+    let (source_key, source_value) = validate_map_entries_field(source_entries)?;
+    let (target_key, target_value) = validate_map_entries_field(target_entries)?;
+    if target_sorted && source_key.data_type() != target_key.data_type() {
+        return _plan_err!("Cannot evolve key type of a sorted map");
+    }
+    validate_map_key_data_type(source_key.data_type(), target_key.data_type())?;
+    validate_field_compatibility(source_value, target_value)?;
+    Ok((target_key, target_value))
+}
+
+fn validate_map_key_data_type(
+    source_type: &DataType,
+    target_type: &DataType,
+) -> Result<()> {
+    if source_type == target_type {
+        return Ok(());
+    }
+
+    match (source_type, target_type) {
+        (Struct(source_fields), Struct(target_fields)) => {
+            if !has_one_of_more_common_fields(source_fields, target_fields) {
+                return _plan_err!(
+                    "Cannot cast map key struct because there is no field name overlap"
+                );
+            }
+
+            let target_by_name: HashMap<&str, &FieldRef> = target_fields
+                .iter()
+                .map(|field| (field.name().as_str(), field))
+                .collect();
+            let source_names: HashSet<&str> = source_fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect();
+            if source_names.len() != source_fields.len()
+                || target_by_name.len() != target_fields.len()
+            {
+                return _plan_err!(
+                    "Cannot evolve a map key struct with duplicate field names"
+                );
+            }
+
+            for source_field in source_fields {
+                let Some(target_field) = target_by_name.get(source_field.name().as_str())
+                else {
+                    return _plan_err!(
+                        "Cannot remove field '{}' from a map key struct",
+                        source_field.name()
+                    );
+                };
+                if source_field.is_nullable() && !target_field.is_nullable() {
+                    return _plan_err!(
+                        "Cannot cast nullable map key field '{}' to non-nullable field",
+                        source_field.name()
+                    );
+                }
+                validate_map_key_data_type(
+                    source_field.data_type(),
+                    target_field.data_type(),
+                )?;
+            }
+            for target_field in target_fields {
+                if !source_names.contains(target_field.name().as_str())
+                    && !target_field.is_nullable()
+                {
+                    return _plan_err!(
+                        "Cannot add non-nullable field '{}' to a map key struct",
+                        target_field.name()
+                    );
+                }
+            }
+            Ok(())
+        }
+        _ if is_injective_map_key_cast(source_type, target_type) => Ok(()),
+        _ => _plan_err!(
+            "Cannot safely evolve map key type from {} to {}",
+            source_type,
+            target_type
+        ),
+    }
+}
+
+// Only allow representation widenings that cannot merge distinct map keys.
+fn is_injective_map_key_cast(source_type: &DataType, target_type: &DataType) -> bool {
+    matches!(
+        (source_type, target_type),
+        (
+            DataType::Int8,
+            DataType::Int16 | DataType::Int32 | DataType::Int64
+        ) | (DataType::Int16, DataType::Int32 | DataType::Int64)
+            | (DataType::Int32, DataType::Int64)
+            | (
+                DataType::UInt8,
+                DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+            )
+            | (
+                DataType::UInt16,
+                DataType::Int32 | DataType::Int64 | DataType::UInt32 | DataType::UInt64
+            )
+            | (DataType::UInt32, DataType::Int64 | DataType::UInt64)
+            | (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View)
+            | (
+                DataType::Binary,
+                DataType::LargeBinary | DataType::BinaryView
+            )
+    )
+}
+
+fn validate_map_entries_field(entries: &Field) -> Result<(&FieldRef, &FieldRef)> {
+    if entries.is_nullable() {
+        return _plan_err!("Map entries field must be non-nullable");
+    }
+    let Struct(fields) = entries.data_type() else {
+        return _plan_err!("Map entries field must be a struct");
+    };
+    if fields.len() != 2 {
+        return _plan_err!(
+            "Map entries struct must contain exactly two fields, found {}",
+            fields.len()
+        );
+    }
+    if fields[0].is_nullable() {
+        return _plan_err!("Map key field must be non-nullable");
+    }
+    Ok((&fields[0], &fields[1]))
+}
+
 fn validate_union_schema_compatibility(
     source_fields: &UnionFields,
     source_mode: &UnionMode,
@@ -605,6 +819,12 @@ fn validate_union_schema_compatibility(
 
 /// Validates that `source_type` can be cast to `target_type`, recursively
 /// handling container types that wrap structs.
+///
+/// Map entry children are matched by position: key, then value. Struct fields
+/// within those children are matched by name. Values can omit source fields
+/// and add nullable fields. Key changes must preserve distinct keys, and sorted
+/// maps require an unchanged key type. Maps without nested structs retain
+/// Arrow's normal casting rules.
 pub fn validate_data_type_compatibility(
     field_name: &str,
     source_type: &DataType,
@@ -625,6 +845,15 @@ pub fn validate_data_type_compatibility(
         | (DataType::ListView(s), DataType::ListView(t))
         | (DataType::LargeListView(s), DataType::LargeListView(t)) => {
             validate_field_compatibility(s, t)?;
+        }
+        (DataType::Map(s, source_sorted), DataType::Map(t, target_sorted))
+            if requires_nested_struct_cast(source_type, target_type) =>
+        {
+            validate_map_compatibility(s, *source_sorted, t, *target_sorted).map_err(
+                |error| {
+                    error.context(format!("While validating map field '{field_name}'"))
+                },
+            )?;
         }
         (DataType::Dictionary(s_key, s_val), DataType::Dictionary(t_key, t_val)) => {
             if !can_cast_types(s_key, t_key) {
@@ -667,7 +896,9 @@ pub fn validate_data_type_compatibility(
 ///
 /// This is the case when both types are struct types, or both are the same
 /// container type (List, LargeList, equal-width FixedSizeList, ListView,
-/// LargeListView, Dictionary) wrapping types that recursively contain structs.
+/// LargeListView, Map, Dictionary) wrapping types that recursively contain structs.
+/// A map qualifies only when its key or value contains a struct, not merely
+/// because its entries use a struct internally.
 ///
 /// Use this predicate at both planning time (to decide whether to apply struct
 /// compatibility validation) and execution time (to decide whether to route
@@ -689,6 +920,22 @@ pub fn requires_nested_struct_cast(
         | (DataType::ListView(s), DataType::ListView(t))
         | (DataType::LargeListView(s), DataType::LargeListView(t)) => {
             requires_nested_struct_cast(s.data_type(), t.data_type())
+        }
+        (DataType::Map(s, _), DataType::Map(t, _)) => {
+            let (Struct(source_fields), Struct(target_fields)) =
+                (s.data_type(), t.data_type())
+            else {
+                return false;
+            };
+            source_fields.len() == 2
+                && target_fields.len() == 2
+                && (requires_nested_struct_cast(
+                    source_fields[0].data_type(),
+                    target_fields[0].data_type(),
+                ) || requires_nested_struct_cast(
+                    source_fields[1].data_type(),
+                    target_fields[1].data_type(),
+                ))
         }
         (DataType::Dictionary(_, s_val), DataType::Dictionary(_, t_val)) => {
             requires_nested_struct_cast(s_val, t_val)
