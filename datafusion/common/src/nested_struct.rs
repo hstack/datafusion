@@ -37,6 +37,7 @@ use std::{collections::HashSet, sync::Arc};
 /// - **No Positional Mapping**: Structs with no overlapping field names are rejected
 /// - **Type Adaptation**: When a matching field is found, it is recursively cast to the target field's type
 /// - **Missing Fields**: Target fields not present in the source are filled with null values
+/// - **Empty Source Structs**: All nullable target fields are filled with null values
 /// - **Extra Fields**: Source fields not present in the target are ignored
 ///
 /// ## Nested Struct Handling
@@ -460,7 +461,7 @@ pub fn validate_struct_compatibility(
     target_fields: &[FieldRef],
 ) -> Result<()> {
     let has_overlap = has_one_of_more_common_fields(source_fields, target_fields);
-    if !has_overlap {
+    if !source_fields.is_empty() && !has_overlap {
         return _plan_err!(
             "Cannot cast struct with {} fields to {} fields because there is no field name overlap",
             source_fields.len(),
@@ -841,6 +842,31 @@ mod tests {
         // Should be OK - missing fields will be filled with nulls
         let result = validate_struct_compatibility(&source_fields, &target_fields);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cast_empty_struct_to_struct() {
+        let source_struct = StructArray::try_new_with_length(
+            Vec::<FieldRef>::new().into(),
+            vec![],
+            None,
+            2,
+        )
+        .unwrap();
+        let source_col: ArrayRef = Arc::new(source_struct);
+        let target_type = struct_type(vec![
+            field("field1", DataType::Int32),
+            field("field2", DataType::Utf8),
+        ]);
+
+        let result = cast_column(&source_col, &target_type, &DEFAULT_CAST_OPTIONS)
+            .unwrap();
+        let result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.column(0).is_null(0));
+        assert!(result.column(0).is_null(1));
+        assert!(result.column(1).is_null(0));
+        assert!(result.column(1).is_null(1));
     }
 
     #[test]
