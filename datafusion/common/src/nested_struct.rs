@@ -41,9 +41,10 @@ use std::{
 ///
 /// ## Field Matching Strategy
 /// - **By Name**: Source struct fields are matched to target fields by name (case-sensitive)
-/// - **No Positional Mapping**: Structs with no overlapping field names are rejected
+/// - **No Positional Mapping**: Nonempty source structs with no overlapping field names are rejected
 /// - **Type Adaptation**: When a matching field is found, it is recursively cast to the target field's type
 /// - **Missing Fields**: Target fields not present in the source are filled with null values
+/// - Empty source structs: Nullable target fields are filled with null values
 /// - **Extra Fields**: Source fields not present in the target are ignored
 ///
 /// ## Nested Struct Handling
@@ -536,7 +537,8 @@ fn cast_dictionary_column(
 ///
 /// # Compatibility Rules
 /// - **Field Matching**: Fields are matched by name (case-sensitive)
-/// - **Missing Target Fields**: Allowed - will be filled with null values during casting
+/// - Empty source structs: Allowed when every target field is nullable
+/// - **Missing Target Fields**: Allowed only for nullable fields, filled with null values during casting
 /// - **Extra Source Fields**: Allowed - will be ignored during casting
 /// - **Type Compatibility**: Each matching field must be castable using Arrow's type system
 /// - **Nested Structs**: Recursively validates nested struct compatibility
@@ -567,7 +569,7 @@ pub fn validate_struct_compatibility(
     target_fields: &[FieldRef],
 ) -> Result<()> {
     let has_overlap = has_one_of_more_common_fields(source_fields, target_fields);
-    if !has_overlap {
+    if !source_fields.is_empty() && !has_overlap {
         return _plan_err!(
             "Cannot cast struct with {} fields to {} fields because there is no field name overlap",
             source_fields.len(),
