@@ -55,13 +55,14 @@
 //! leaf, so every struct level that is clipped must keep at least one leaf.
 //! A struct cast with zero field-name overlap at *any* nesting depth would
 //! break that: the reader drops a field whose leaves are all masked out, so
-//! the emitted type would not match the one predicted here. Such a cast is
+//! the emitted type would not match the one predicted here. Such a cast from
+//! a nonempty source struct is
 //! rejected during physical planning
 //! (`datafusion_common::nested_struct::validate_struct_compatibility`, called
 //! recursively from `DefaultPhysicalExprAdapter::rewrite`) and by the logical
-//! planner's own castability check, so it should never reach this module; if
-//! one does anyway (a custom `PhysicalExprAdapter` could build one),
-//! [`clip_for_cast`] detects the empty level and declines to clip.
+//! planner's own castability check. Empty source structs can gain nullable
+//! fields, but have no leaves to prune. In either case, [`clip_for_cast`]
+//! detects an empty level and declines to clip.
 //!
 //! The clip is *total*: any type shape it does not understand (maps,
 //! dictionaries, wrapper-kind mismatches, ...) keeps all of its leaves, so
