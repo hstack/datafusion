@@ -35,6 +35,7 @@ use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 
 use datafusion_common::Result;
+use datafusion_common::deep::can_cast_datatype_deep;
 use datafusion_common::nested_struct::requires_nested_struct_cast;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_functions::core::file_row_index::FileRowIndexFunc;
@@ -348,7 +349,30 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
         {
             let args = func.args();
 
-            if let Some(column) = args.first().and_then(|a| a.downcast_ref::<Column>()) {
+            // @HStack - try harder to find the first column parameter.
+            // If the field is a cast, ensure the cast is a strictly-castable
+            // widening/compatible cast before treating it like a plain column
+            // reference.
+            let first_arg_column = args.first().and_then(|a| {
+                if let Some(col) = a.downcast_ref::<Column>() {
+                    Some(col)
+                } else if let Some(cast) = a.downcast_ref::<CastExpr>()
+                    && let Some(col) = cast.children()[0].downcast_ref::<Column>()
+                    && let Ok(field_in_schema) =
+                        self.file_schema.field_with_name(col.name())
+                    && can_cast_datatype_deep(
+                        field_in_schema.data_type(),
+                        cast.cast_type(),
+                        true,
+                    )
+                {
+                    Some(col)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(column) = first_arg_column {
                 // for Map columns, get_field performs a runtime key lookup rather than a
                 // schema-level field access so the entire Map column must be read,
                 // we skip the struct field optimization and defer to normal Column traversal
