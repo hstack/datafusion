@@ -35,6 +35,7 @@ use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 
 use datafusion_common::Result;
+use datafusion_common::deep::can_cast_datatype_deep;
 use datafusion_common::nested_struct::requires_nested_struct_cast;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_functions::core::file_row_index::FileRowIndexFunc;
@@ -347,7 +348,31 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
         {
             let args = func.args();
 
-            if let Some(column) = args.first().and_then(|a| a.downcast_ref::<Column>()) {
+            // @HStack - try harder to find the first column parameter.
+            // If the field access is wrapped in a cast (e.g. upstream hasn't
+            // moved the cast inside the `get_field` call), still recognize
+            // the underlying column as long as the cast is strictly castable
+            // against the file schema's field type.
+            let first_arg_column = args.first().and_then(|a| {
+                if let Some(col) = a.downcast_ref::<Column>() {
+                    Some(col)
+                } else if let Some(cast) = a.downcast_ref::<CastExpr>()
+                    && let Some(col) = cast.children()[0].downcast_ref::<Column>()
+                    && let Ok(field_in_schema) =
+                        self.file_schema.field_with_name(col.name())
+                    && can_cast_datatype_deep(
+                        field_in_schema.data_type(),
+                        cast.cast_type(),
+                        true,
+                    )
+                {
+                    Some(col)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(column) = first_arg_column {
                 // for Map columns, get_field performs a runtime key lookup rather than a
                 // schema-level field access so the entire Map column must be read,
                 // we skip the struct field optimization and defer to normal Column traversal
@@ -1066,6 +1091,7 @@ mod test {
     use arrow::array::{Int32Array, RecordBatch, StringArray, StructArray};
     use arrow::datatypes::Fields;
     use datafusion_common::ScalarValue;
+    use datafusion_common::config::ConfigOptions;
     use datafusion_expr::{Expr, col};
     use datafusion_functions::core::get_field;
     use datafusion_physical_expr::planner::logical2physical;
@@ -1590,6 +1616,54 @@ mod test {
                 .into()
             ),
         );
+    }
+
+    /// `get_field(CAST(col), 'field')` -- the cast sits *inside* the
+    /// `get_field` call on a single expression, rather than appearing as its
+    /// own sibling node. The cast target is a strict subset of the file's
+    /// struct type, so the checker should still recognize the underlying
+    /// column and prune to the accessed leaf, instead of falling back to a
+    /// whole-root-column read.
+    #[test]
+    fn build_projection_read_plan_clips_get_field_over_cast() {
+        let (file_schema, metadata) = write_id_struct_file();
+        let schema_descr = metadata.file_metadata().schema_descr();
+
+        let narrow = DataType::Struct(
+            vec![
+                Arc::new(Field::new("value", DataType::Int32, true)),
+                Arc::new(Field::new("label", DataType::Utf8, true)),
+            ]
+            .into(),
+        );
+        let cast_s = Arc::new(CastExpr::new(
+            Arc::new(PhysicalColumn::new("s", 1)),
+            narrow,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+
+        let get_field_over_cast = Arc::new(
+            ScalarFunctionExpr::try_new(
+                get_field(),
+                vec![
+                    cast_s,
+                    Arc::new(Literal::new(ScalarValue::Utf8(Some("value".to_string())))),
+                ],
+                &file_schema,
+                Arc::new(ConfigOptions::default()),
+            )
+            .expect("building get_field(CAST(..)) expr"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        let exprs: Vec<Arc<dyn PhysicalExpr>> =
+            vec![Arc::new(PhysicalColumn::new("id", 0)), get_field_over_cast];
+
+        let read_plan = build_projection_read_plan(exprs, &file_schema, schema_descr);
+
+        // Only id's leaf (0) and s.value's leaf (1) should be read: s.label
+        // and s.pad are clipped away, same as a direct struct access would.
+        let expected_mask = ProjectionMask::leaves(schema_descr, [0, 1]);
+        assert_eq!(read_plan.projection_mask, expected_mask);
     }
 
     fn access(root: usize, path: &[&str]) -> StructFieldAccess {
