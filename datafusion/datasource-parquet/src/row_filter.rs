@@ -78,11 +78,12 @@ use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
-use datafusion_common::Result;
+use datafusion_common::{DFSchema, Result};
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::deep::{can_cast_datatype_deep, cast_record_batch};
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 
@@ -113,6 +114,9 @@ pub(crate) struct DatafusionArrowPredicate {
     /// Path to the leaf columns in the parquet schema required to evaluate the
     /// expression
     projection_mask: ProjectionMask,
+    /// Schema expected by `physical_expr`. This can contain empty struct columns
+    /// that are not present in the batch produced by an empty Parquet projection.
+    projected_schema: SchemaRef,
     /// how many rows were filtered out by this predicate
     rows_pruned: metrics::Count,
     /// how many rows passed this predicate
@@ -129,12 +133,13 @@ impl DatafusionArrowPredicate {
         rows_matched: metrics::Count,
         time: metrics::Time,
     ) -> Result<Self> {
-        let physical_expr =
-            reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
+        let projected_schema = Arc::clone(&candidate.read_plan.projected_schema);
+        let physical_expr = reassign_expr_columns(candidate.expr, &projected_schema)?;
 
         Ok(Self {
             physical_expr,
             projection_mask: candidate.read_plan.projection_mask,
+            projected_schema,
             rows_pruned,
             rows_matched,
             time,
@@ -150,6 +155,25 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
         // scoped timer updates on drop
         let mut timer = self.time.timer();
+
+        let batch = if batch.schema() != self.projected_schema
+            && !batch.schema().fields().is_empty()
+            && !self.projected_schema.fields().is_empty()
+        {
+            cast_record_batch(
+                &batch,
+                Arc::clone(&self.projected_schema),
+                false,
+                true,
+            )
+            .map_err(|e| {
+                ArrowError::ComputeError(format!(
+                    "Error adapting filter predicate batch: {e:?}"
+                ))
+            })?
+        } else {
+            batch
+        };
 
         self.physical_expr
             .evaluate(&batch)
@@ -420,7 +444,30 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
         {
             let args = func.args();
 
-            if let Some(column) = args.first().and_then(|a| a.downcast_ref::<Column>()) {
+            // @HStack - try harder to find the first column parameter
+            // If the field is a cast - but ensure strict castability
+            let first_arg_column = args.first().and_then(|a| {
+                if let Some(col) = a.downcast_ref::<Column>() {
+                    Some(col)
+                } else if let Some(cast) = a.downcast_ref::<CastExpr>()
+                    && let Some(col) =
+                        cast.children()[0].downcast_ref::<Column>()
+                    && let Ok(field_in_schema) =
+                        self.file_schema.field_with_name(col.name())
+                    && can_cast_datatype_deep(
+                        field_in_schema.data_type(),
+                        cast.cast_type(),
+                        true,
+                    )
+                {
+                    Some(col)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(column) = first_arg_column {
+            // if let Some(column) = args.first().and_then(|a| a.downcast_ref::<Column>()) {
                 // for Map columns, get_field performs a runtime key lookup rather than a
                 // schema-level field access so the entire Map column must be read,
                 // we skip the struct field optimization and defer to normal Column traversal
