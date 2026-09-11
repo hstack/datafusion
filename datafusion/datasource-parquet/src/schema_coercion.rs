@@ -51,6 +51,8 @@ pub fn apply_file_schema_type_coercions(
     table_schema: &Schema,
     file_schema: &Schema,
 ) -> Option<Schema> {
+    return apply_file_schema_type_coercions_nested(table_schema, file_schema);
+
     let mut needs_view_transform = false;
     let mut needs_string_transform = false;
 
@@ -128,6 +130,155 @@ pub fn apply_file_schema_type_coercions(
             Arc::clone(field)
         })
         .collect();
+
+    Some(Schema::new_with_metadata(
+        transformed_fields,
+        file_schema.metadata.clone(),
+    ))
+    //
+}
+
+/// Apply string and binary type coercions recursively within structs, lists, and maps.
+///
+/// Struct fields match by name. List elements and map entries retain their physical
+/// container types. File field order, nullability, and metadata remain unchanged.
+/// Missing fields are not added; expression adaptation handles them separately.
+/// Returns `None` if no file field types change.
+pub fn apply_file_schema_type_coercions_nested(
+    table_schema: &Schema,
+    file_schema: &Schema,
+) -> Option<Schema> {
+    let mut needs_view_transform = false;
+    let mut needs_string_transform = false;
+    let mut needs_nested_transform = false;
+
+    // Create a mapping of table field names to their data types for fast lookup
+    // and simultaneously check if we need any transformations
+    let table_fields: HashMap<_, _> = table_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let dt = f.data_type();
+            // Check if we need view type transformation
+            if matches!(dt, &DataType::Utf8View | &DataType::BinaryView) {
+                needs_view_transform = true;
+            }
+            // Check if we need string type transformation
+            if matches!(
+                dt,
+                &DataType::Utf8 | &DataType::LargeUtf8 | &DataType::Utf8View
+            ) {
+                needs_string_transform = true;
+            }
+            // Nested fields can need transformations even when their parent does not.
+            if matches!(
+                dt,
+                DataType::Struct(_)
+                    | DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::ListView(_)
+                    | DataType::LargeListView(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::Map(_, _)
+            ) {
+                needs_nested_transform = true;
+            }
+
+            (f.name(), dt)
+        })
+        .collect();
+
+    // Early return if no transformation needed
+    if !needs_view_transform && !needs_string_transform && !needs_nested_transform {
+        return None;
+    }
+
+    let transformed_fields: Vec<Arc<Field>> = file_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let field_name = field.name();
+            let field_type = field.data_type();
+
+            // Look up the corresponding field type in the table schema
+            if let Some(table_type) = table_fields.get(field_name) {
+                match (table_type, field_type) {
+                    // table schema uses string type, coerce the file schema to use string type
+                    (
+                        &DataType::Utf8,
+                        DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+                    ) => {
+                        return field_with_new_type(field, DataType::Utf8);
+                    }
+                    // table schema uses large string type, coerce the file schema to use large string type
+                    (
+                        &DataType::LargeUtf8,
+                        DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+                    ) => {
+                        return field_with_new_type(field, DataType::LargeUtf8);
+                    }
+                    // table schema uses string view type, coerce the file schema to use view type
+                    (
+                        &DataType::Utf8View,
+                        DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+                    ) => {
+                        return field_with_new_type(field, DataType::Utf8View);
+                    }
+                    // Handle view type conversions
+                    (&DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8) => {
+                        return field_with_new_type(field, DataType::Utf8View);
+                    }
+                    (&DataType::BinaryView, DataType::Binary | DataType::LargeBinary) => {
+                        return field_with_new_type(field, DataType::BinaryView);
+                    }
+                    // Apply the same coercions to matching fields inside structs.
+                    (DataType::Struct(table_fields), DataType::Struct(file_fields)) => {
+                        if let Some(schema) = apply_file_schema_type_coercions_nested(
+                            &Schema::new(table_fields.clone()),
+                            &Schema::new(file_fields.clone()),
+                        ) {
+                            return field_with_new_type(field, DataType::Struct(schema.fields));
+                        }
+                    }
+                    // Container children match by position, regardless of their names.
+                    (DataType::List(table_child), DataType::List(file_child))
+                    | (DataType::LargeList(table_child), DataType::LargeList(file_child))
+                    | (DataType::ListView(table_child), DataType::ListView(file_child))
+                    | (DataType::LargeListView(table_child), DataType::LargeListView(file_child))
+                    | (DataType::FixedSizeList(table_child, _), DataType::FixedSizeList(file_child, _))
+                    | (DataType::Map(table_child, _), DataType::Map(file_child, _)) => {
+                        if let Some(schema) = apply_file_schema_type_coercions_nested(
+                            &Schema::new(vec![field_with_new_type(
+                                file_child,
+                                table_child.data_type().clone(),
+                            )]),
+                            &Schema::new(vec![Arc::clone(file_child)]),
+                        ) {
+                            let child = Arc::clone(&schema.fields()[0]);
+                            let new_type = match field_type {
+                                DataType::List(_) => DataType::List(child),
+                                DataType::LargeList(_) => DataType::LargeList(child),
+                                DataType::ListView(_) => DataType::ListView(child),
+                                DataType::LargeListView(_) => DataType::LargeListView(child),
+                                DataType::FixedSizeList(_, size) => DataType::FixedSizeList(child, *size),
+                                DataType::Map(_, sorted) => DataType::Map(child, *sorted),
+                                _ => return Arc::clone(field),
+                            };
+                            return field_with_new_type(field, new_type);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // If no transformation is needed, keep the original field
+            Arc::clone(field)
+        })
+        .collect();
+
+    if transformed_fields.iter().eq(file_schema.fields().iter()) {
+        return None;
+    }
 
     Some(Schema::new_with_metadata(
         transformed_fields,
