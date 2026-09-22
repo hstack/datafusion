@@ -22,12 +22,47 @@ use arrow::compute::SortOptions;
 use datafusion_common::Statistics;
 use datafusion_common::utils::compare_rows;
 use itertools::Itertools;
-use std::cmp::{Ordering, min};
+use std::cmp::{Ordering, Reverse, min};
 use std::collections::{BinaryHeap, HashMap};
 use std::iter::repeat_with;
 use std::mem;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// Fixed, size-independent per-file open cost in nanoseconds used by the
+/// skew-aware bin-packing splitter. Calibrated from measured
+/// `metadata_load_time / files_opened` (~29 ms/file on blob storage): opening a
+/// Parquet file costs roughly one metadata roundtrip regardless of its size.
+const FILE_OPEN_COST_NS: u64 = 30_000_000;
+
+/// Per-byte transfer + decode cost in nanoseconds used by the skew-aware
+/// bin-packing splitter. `100 ns/byte` is ~10 MB/s of effective per-stream
+/// throughput, deliberately conservative because many files are read
+/// concurrently against a single shared object-store endpoint. This is the
+/// least-certain constant and is expected to be tuned with real measurements.
+const NS_PER_BYTE: u64 = 100;
+
+/// The skew-aware splitter only engages when there are at least this many files
+/// per target partition (enough that per-file open I/O dominates and small
+/// files would otherwise concentrate onto a single partition).
+const BIN_PACK_MIN_FILES_PER_PARTITION: usize = 3;
+
+/// The skew-aware splitter only engages when the byte-range splitter would give
+/// its most file-heavy partition at least this many times the average file
+/// count. A ratio of `2.0` means one partition would open twice as many files
+/// as the average, dominating query latency with per-file open overhead.
+/// Uniform distributions (ratio ~= 1) are left on the byte-range splitter.
+const BIN_PACK_FILE_COUNT_SKEW_RATIO: f64 = 2.0;
+
+/// Environment variable that sets the default for whether
+/// [`FileGroupPartitioner`] bin-packs skewed tables.
+const BIN_PACK_SKEWED_ENV: &str = "DATAFUSION_FILE_GROUP_BIN_PACK_SKEWED";
+
+static BIN_PACK_SKEWED_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var(BIN_PACK_SKEWED_ENV)
+        .map(|v| v == "true")
+        .unwrap_or(true)
+});
 
 /// Repartition input files into `target_partitions` partitions, if total file size exceed
 /// `repartition_file_min_size`
@@ -135,6 +170,12 @@ pub struct FileGroupPartitioner {
     repartition_file_min_size: usize,
     /// if the order when reading the files must be preserved
     preserve_order_within_groups: bool,
+    /// Whether to bin-pack whole files (balancing estimated read time) for tables
+    /// detected as "large and uneven", instead of the default byte-range splitter.
+    /// Always gated by [`Self::is_skewed`], so enabling this never forces
+    /// bin-packing on a uniform table. Defaults to the
+    /// `DATAFUSION_FILE_GROUP_BIN_PACK_SKEWED` env var (or `true`).
+    bin_pack_skewed: bool,
 }
 
 impl Default for FileGroupPartitioner {
@@ -148,11 +189,14 @@ impl FileGroupPartitioner {
     /// 1. `target_partitions = 1`
     /// 2. `repartition_file_min_size = 10MB`
     /// 3. `preserve_order_within_groups = false`
+    /// 4. `bin_pack_skewed` = `DATAFUSION_FILE_GROUP_BIN_PACK_SKEWED` env var
+    ///    (default `true`)
     pub fn new() -> Self {
         Self {
             target_partitions: 1,
             repartition_file_min_size: 10 * 1024 * 1024,
             preserve_order_within_groups: false,
+            bin_pack_skewed: *BIN_PACK_SKEWED_ENABLED,
         }
     }
 
@@ -180,6 +224,38 @@ impl FileGroupPartitioner {
         self
     }
 
+    /// Set whether to bin-pack whole files for tables detected as skewed. When
+    /// `true`, [`Self::repartition_by_bin_packing`] is used instead of the
+    /// byte-range splitter, but only for tables [`Self::is_skewed`] flags as
+    /// "large and uneven" — never for uniform tables. Has no effect when order
+    /// must be preserved.
+    pub fn with_bin_pack_skewed(mut self, bin_pack_skewed: bool) -> Self {
+        self.bin_pack_skewed = bin_pack_skewed;
+        self
+    }
+
+    /// Whether these file groups should be bin-packed: only when enabled via
+    /// [`Self::with_bin_pack_skewed`], the input is whole files (not already
+    /// byte-range split by a prior repartitioning), *and* [`Self::is_skewed`]
+    /// detects skew.
+    fn should_bin_pack(&self, file_groups: &[FileGroup]) -> bool {
+        self.bin_pack_skewed
+            && !Self::has_range_split_files(file_groups)
+            && self.is_skewed(file_groups)
+    }
+
+    /// Whether any input file is already a proper byte-range slice (its scanned
+    /// range is smaller than the whole object). Bin-packing regroups whole files
+    /// to cut file-open I/O; once a prior pass has split files by range those
+    /// opens are already committed, so such inputs are left to the byte-range
+    /// splitter. A full-file range (`0..size`) counts as a whole file.
+    fn has_range_split_files(file_groups: &[FileGroup]) -> bool {
+        file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .any(|f| f.effective_size() < f.object_meta.size)
+    }
+
     /// Repartition input files according to the settings on this [`FileGroupPartitioner`].
     ///
     /// If no repartitioning is needed or possible, return `None`.
@@ -194,6 +270,8 @@ impl FileGroupPartitioner {
         //  special case when order must be preserved
         if self.preserve_order_within_groups {
             self.repartition_preserving_order(file_groups)
+        } else if self.should_bin_pack(file_groups) {
+            self.repartition_by_bin_packing(file_groups)
         } else {
             self.repartition_evenly_by_size(file_groups)
         }
@@ -374,6 +452,129 @@ impl FileGroupPartitioner {
         }
 
         Some(file_groups)
+    }
+
+    /// Estimated wall-clock time in nanoseconds to open and read `file`,
+    /// modeling blob-storage access as a fixed per-file open latency plus a
+    /// per-byte transfer/decode cost. Used to bin-pack files by estimated time.
+    fn file_cost_ns(file: &PartitionedFile) -> u64 {
+        FILE_OPEN_COST_NS + file.effective_size().saturating_mul(NS_PER_BYTE)
+    }
+
+    /// Detect tables that are "large and uneven" enough that the default
+    /// byte-range splitter would concentrate many small files onto a single
+    /// partition, paying a large per-file open cost and creating a straggler.
+    ///
+    /// A table qualifies when it has both:
+    /// - *many* files relative to the target partitions
+    ///   ([`BIN_PACK_MIN_FILES_PER_PARTITION`] per partition), and
+    /// - a predicted *file-count imbalance* of at least
+    ///   [`BIN_PACK_FILE_COUNT_SKEW_RATIO`] (see below).
+    ///
+    /// The imbalance is predicted directly rather than inferred from a
+    /// size-distribution shape: the byte-range splitter gives every partition an
+    /// equal byte budget, so its most file-heavy partition is the one filled with
+    /// the *smallest* files. We estimate that partition's file count by greedily
+    /// accumulating the smallest files up to one budget, then compare it to the
+    /// average file count per partition. This catches skew regardless of whether
+    /// the small files are a minority or majority by count.
+    ///
+    /// Uniform distributions (ratio ~= 1) are intentionally left on the
+    /// byte-range splitter, which already yields even file counts for them and
+    /// can split a single oversized file (something bin-packing never does).
+    fn is_skewed(&self, file_groups: &[FileGroup]) -> bool {
+        let target_partitions = self.target_partitions;
+        if target_partitions == 0 {
+            return false;
+        }
+
+        let mut sizes: Vec<u64> = file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .map(|f| f.effective_size())
+            .collect();
+
+        let num_files = sizes.len();
+        if num_files < BIN_PACK_MIN_FILES_PER_PARTITION * target_partitions {
+            return false;
+        }
+
+        let total_size: u64 = sizes.iter().sum();
+        if total_size == 0 {
+            return false;
+        }
+
+        // Estimate the file count of the fattest byte-balanced partition by
+        // filling one equal byte budget with the smallest files.
+        let budget = total_size / target_partitions as u64;
+        sizes.sort_unstable();
+        let mut accumulated = 0u64;
+        let mut fattest_count = 0usize;
+        for &size in &sizes {
+            accumulated += size;
+            fattest_count += 1;
+            if accumulated >= budget {
+                break;
+            }
+        }
+
+        let mean_count = num_files as f64 / target_partitions as f64;
+        fattest_count as f64 / mean_count >= BIN_PACK_FILE_COUNT_SKEW_RATIO
+    }
+
+    /// Repartition by bin-packing whole files into `target_partitions` groups,
+    /// balancing each group's estimated read time ([`Self::file_cost_ns`]).
+    ///
+    /// Unlike [`Self::repartition_evenly_by_size`], files are never split at byte
+    /// boundaries. Using a Longest-Processing-Time greedy assignment, large files
+    /// are placed first (one per group) and small files then fill the lightest
+    /// groups, so every partition ends up with a mix of large and small files and
+    /// a balanced number of file opens.
+    ///
+    /// Returns `None` only for empty input. Empty groups (possible only when
+    /// there are fewer files than `target_partitions`) are dropped.
+    fn repartition_by_bin_packing(
+        &self,
+        file_groups: &[FileGroup],
+    ) -> Option<Vec<FileGroup>> {
+        let target_partitions = self.target_partitions;
+        if target_partitions == 0 {
+            return None;
+        }
+
+        let mut files: Vec<PartitionedFile> = file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .cloned()
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+
+        // Heaviest files first; break ties by path for deterministic output.
+        files.sort_by(|a, b| {
+            Self::file_cost_ns(b)
+                .cmp(&Self::file_cost_ns(a))
+                .then_with(|| a.path().cmp(b.path()))
+        });
+
+        // Min-heap of (current_load, group_index): always extend the lightest
+        // group. The index in the key keeps ties deterministic.
+        let mut bins: Vec<FileGroup> = (0..target_partitions)
+            .map(|_| FileGroup::default())
+            .collect();
+        let mut heap: BinaryHeap<Reverse<(u64, usize)>> =
+            (0..target_partitions).map(|i| Reverse((0, i))).collect();
+
+        for file in files {
+            let cost = Self::file_cost_ns(&file);
+            let Reverse((load, index)) = heap.pop().expect("heap is non-empty");
+            bins[index].push(file);
+            heap.push(Reverse((load + cost, index)));
+        }
+
+        // Drop empty groups (possible only when files < target_partitions).
+        Some(bins.into_iter().filter(|g| !g.is_empty()).collect())
     }
 }
 
@@ -1378,5 +1579,202 @@ mod test {
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[1].len(), 2);
         assert_eq!(groups[2].len(), 1);
+    }
+
+    // --- skew-aware bin-packing splitter tests ---
+
+    /// True if any file in any group carries a byte range (i.e. was split).
+    fn has_any_range(groups: &[FileGroup]) -> bool {
+        groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .any(|f| f.range.is_some())
+    }
+
+    /// Build `n` groups of one file each with the given size, named `<prefix><i>`.
+    fn single_file_groups(prefix: &str, size: u64, n: usize) -> Vec<FileGroup> {
+        (0..n)
+            .map(|i| FileGroup::new(vec![pfile(format!("{prefix}{i}"), size)]))
+            .collect()
+    }
+
+    #[test]
+    fn is_skewed_detects_large_and_uneven() {
+        // 4 large (400MB) + 16 small (1MB) = 20 files across 4 partitions.
+        // 20 >= 3*4 files and mean/median ~= 80 >= 3.0 -> skewed.
+        let mut groups = single_file_groups("big", 400_000_000, 4);
+        groups.extend(single_file_groups("small", 1_000_000, 16));
+
+        let partitioner = FileGroupPartitioner::new().with_target_partitions(4);
+        assert!(partitioner.is_skewed(&groups));
+    }
+
+    #[test]
+    fn is_skewed_false_on_uniform_sizes() {
+        // 20 identically sized files: mean == median -> not uneven.
+        let groups = single_file_groups("u", 10_000_000, 20);
+
+        let partitioner = FileGroupPartitioner::new().with_target_partitions(4);
+        assert!(!partitioner.is_skewed(&groups));
+    }
+
+    #[test]
+    fn is_skewed_false_on_too_few_files() {
+        // Uneven sizes but only 8 files for 4 partitions (< 3*4) -> not large.
+        let mut groups = single_file_groups("big", 400_000_000, 4);
+        groups.extend(single_file_groups("small", 1_000_000, 4));
+
+        let partitioner = FileGroupPartitioner::new().with_target_partitions(4);
+        assert!(!partitioner.is_skewed(&groups));
+    }
+
+    #[test]
+    fn is_skewed_false_on_all_empty_files() {
+        let groups = single_file_groups("e", 0, 20);
+
+        let partitioner = FileGroupPartitioner::new().with_target_partitions(4);
+        assert!(!partitioner.is_skewed(&groups));
+    }
+
+    #[test]
+    fn is_skewed_detects_minority_small_file_tail() {
+        // Real-world shape: most files are large (~100MB) and a *minority by
+        // count* are small (~20MB). The median sits in the large cluster, so a
+        // mean/median test would miss this, but byte-balancing still concentrates
+        // the many small files onto one partition (fattest ~= 3x the average
+        // file count), which is exactly the straggler we want to detect.
+        let mut groups = single_file_groups("big", 100_000_000, 73);
+        groups.extend(single_file_groups("small", 20_000_000, 27));
+
+        let partitioner = FileGroupPartitioner::new().with_target_partitions(10);
+        assert!(partitioner.is_skewed(&groups));
+    }
+
+    #[test]
+    fn bin_packing_spreads_large_and_small_files() {
+        // 4 large + 16 small into 4 partitions: each partition should get
+        // exactly one large file plus its share of the small files, and no file
+        // should be byte-range split.
+        let mut groups = single_file_groups("big", 400_000_000, 4);
+        groups.extend(single_file_groups("small", 1_000_000, 16));
+
+        let partitioner = FileGroupPartitioner::new().with_target_partitions(4);
+        let result = partitioner
+            .repartition_by_bin_packing(&groups)
+            .expect("skewed input should repartition");
+
+        assert_eq!(result.len(), 4);
+        for group in &result {
+            assert_eq!(group.len(), 5, "each partition gets 1 large + 4 small");
+            let large = group
+                .iter()
+                .filter(|f| f.effective_size() == 400_000_000)
+                .count();
+            assert_eq!(large, 1, "each partition gets exactly one large file");
+        }
+        assert!(!has_any_range(&result), "bin-packing must not split files");
+    }
+
+    #[test]
+    fn bin_packing_is_deterministic() {
+        let mut groups = single_file_groups("big", 400_000_000, 3);
+        groups.extend(single_file_groups("small", 1_000_000, 30));
+
+        let partitioner = FileGroupPartitioner::new().with_target_partitions(5);
+        let a = partitioner.repartition_by_bin_packing(&groups);
+        let b = partitioner.repartition_by_bin_packing(&groups);
+        assert_partitioned_files(a, b);
+    }
+
+    #[test]
+    fn bin_pack_flag_off_keeps_range_splitting() {
+        // Skewed input: with the flag explicitly OFF the default byte-range
+        // splitter runs and produces ranges (regardless of the shipping default).
+        let mut groups = single_file_groups("big", 400_000_000, 4);
+        groups.extend(single_file_groups("small", 1_000_000, 16));
+
+        let result = FileGroupPartitioner::new()
+            .with_target_partitions(4)
+            .with_repartition_file_min_size(100)
+            .with_bin_pack_skewed(false)
+            .repartition_file_groups(&groups)
+            .expect("should repartition");
+
+        assert!(
+            has_any_range(&result),
+            "flag-off path splits files by range"
+        );
+    }
+
+    #[test]
+    fn bin_pack_flag_on_avoids_range_splitting() {
+        // Same skewed input: with the flag ON whole files are bin-packed and no
+        // ranges are produced.
+        let mut groups = single_file_groups("big", 400_000_000, 4);
+        groups.extend(single_file_groups("small", 1_000_000, 16));
+
+        let result = FileGroupPartitioner::new()
+            .with_target_partitions(4)
+            .with_repartition_file_min_size(100)
+            .with_bin_pack_skewed(true)
+            .repartition_file_groups(&groups)
+            .expect("should repartition");
+
+        assert_eq!(result.len(), 4);
+        assert!(!has_any_range(&result), "bin-packing must not split files");
+    }
+
+    #[test]
+    fn bin_pack_enabled_only_when_skewed() {
+        // Enabled: a skewed table is bin-packed (whole files, no ranges) ...
+        let mut skewed = single_file_groups("big", 400_000_000, 4);
+        skewed.extend(single_file_groups("small", 1_000_000, 16));
+        let out = FileGroupPartitioner::new()
+            .with_target_partitions(4)
+            .with_repartition_file_min_size(100)
+            .with_bin_pack_skewed(true)
+            .repartition_file_groups(&skewed)
+            .expect("should repartition");
+        assert!(!has_any_range(&out), "auto + skewed: bin-packed, no ranges");
+
+        // ... but a uniform table stays on the byte-range splitter.
+        let uniform = single_file_groups("u", 100_000_000, 20);
+        let out = FileGroupPartitioner::new()
+            .with_target_partitions(4)
+            .with_repartition_file_min_size(100)
+            .with_bin_pack_skewed(true)
+            .repartition_file_groups(&uniform)
+            .expect("should repartition");
+        assert!(has_any_range(&out), "auto + uniform: byte-range split");
+    }
+
+    #[test]
+    fn bin_pack_skips_range_split_inputs() {
+        let partitioner = FileGroupPartitioner::new()
+            .with_target_partitions(4)
+            .with_bin_pack_skewed(true);
+
+        // Whole-file skewed input -> bin-pack.
+        let mut whole = single_file_groups("big", 400_000_000, 4);
+        whole.extend(single_file_groups("small", 1_000_000, 16));
+        assert!(
+            partitioner.should_bin_pack(&whole),
+            "whole-file skew is bin-packed"
+        );
+
+        // Same size distribution, but the large files are already byte-range
+        // slices (a prior split): leave them to the byte-range splitter.
+        let mut ranged: Vec<FileGroup> = (0..4)
+            .map(|i| {
+                FileGroup::new(vec![
+                    pfile(format!("big{i}"), 400_000_000).with_range(0, 100_000_000),
+                ])
+            })
+            .collect();
+        ranged.extend(single_file_groups("small", 1_000_000, 16));
+        assert!(
+            !partitioner.should_bin_pack(&ranged),
+            "range-split input is left to the byte-range splitter"
+        );
     }
 }
