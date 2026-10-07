@@ -61,26 +61,26 @@ the projection is known at split time.
 
 ## Detection: `is_skewed(&self, file_groups) -> bool`
 
-Bin-packing only helps when the table is both **large** (enough files that open
-I/O dominates and small files can concentrate) and would suffer a **file-count
-imbalance** under byte-balancing. Rather than infer the imbalance from a
-size-distribution shape, predict it directly: the byte-range splitter gives every
-partition an equal byte budget, so its most file-heavy ("fattest") partition is
-the one filled with the *smallest* files. Estimate that partition's file count by
+Bin-packing requires at least one file per target partition and a predicted
+**file-count imbalance** under byte-balancing. The file-count guard keeps all
+target partitions available for whole-file assignment. The detector predicts
+the imbalance directly instead of relying on the size-distribution shape.
+The byte-range splitter gives every partition an equal byte budget. Its most
+file-heavy ("fattest") partition is the one filled with the *smallest* files.
+Estimate that partition's file count by
 greedily accumulating the smallest files up to one budget, then compare it to the
 average file count per partition. Measured over the flattened input file list:
 
 ```
 num_files = count(files)
-large   = num_files >= BIN_PACK_MIN_FILES_PER_PARTITION * target_partitions
+enough_files = num_files >= target_partitions
 budget  = total_size / target_partitions
 fattest_count = number of smallest files whose sizes sum to >= budget
-skewed  = total_size > 0 && large
+skewed  = total_size > 0 && enough_files
           && fattest_count / (num_files / target_partitions)
              >= BIN_PACK_FILE_COUNT_SKEW_RATIO
 ```
 
-- `BIN_PACK_MIN_FILES_PER_PARTITION = 3`
 - `BIN_PACK_FILE_COUNT_SKEW_RATIO = 2.0` — "one partition would open at least
   twice the average number of files."
 
@@ -90,8 +90,8 @@ predicts the outcome directly, this is **direction-agnostic**: it catches both
 common "mostly large files + a minority of small files" (median sits in the large
 cluster, so a `mean/median` test would miss it — this was the real-world miss that
 motivated the approach). Uniform tables give a ratio ~= 1 and stay on the existing
-path. Few-file tables stay on the range-splitter, which can split a single giant
-file — something bin-packing deliberately never does.
+path. Tables with fewer files than target partitions stay on the range-splitter.
+It can split a single giant file — something bin-packing deliberately never does.
 
 ### Worked example (real distributed plan, DS2)
 
