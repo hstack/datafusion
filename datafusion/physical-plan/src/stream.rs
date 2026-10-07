@@ -43,25 +43,46 @@ use pin_project_lite::pin_project;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-/// Creates a stream from a collection of producing tasks, routing panics to the stream.
+/// Builds a bounded receiver stream of generic items produced by tracked tasks.
 ///
-/// Note that this is similar to  [`ReceiverStream` from tokio-stream], with the differences being:
+/// Items of type `O` are sent as [`Result<O>`] through the channel returned by
+/// [`Self::tx`]. Unlike [`RecordBatchReceiverStreamBuilder`], this builder does
+/// not require [`RecordBatch`] items or a schema.
 ///
-/// 1. Methods to bound and "detach"  tasks (`spawn()` and `spawn_blocking()`).
+/// In addition to errors sent through the channel, the stream forwards the first
+/// observed error returned by a tracked task, without requiring that task to
+/// send the error through the channel. Task panics are resumed in the caller
+/// polling the stream, rather than converted to stream errors.
 ///
-/// 2. Propagates panics, whereas the `tokio` version doesn't propagate panics to the receiver.
+/// An error item does **not** guarantee that the stream ends: queued channel
+/// items or items sent by other sender handles can still be yielded. Consumers
+/// requiring termination on the first error should stop polling and drop the
+/// stream.
 ///
-/// 3. Automatically cancels any outstanding tasks when the receiver stream is dropped.
+/// Dropping the builder or its stream aborts outstanding tracked asynchronous
+/// tasks, even if the stream has never been polled. Cancellation takes effect
+/// when those tasks next yield to the runtime. Blocking tasks that have already
+/// started cannot be forcibly stopped; see [`Self::spawn_blocking`].
 ///
+/// This is similar to [`ReceiverStream` from tokio-stream], but also tracks
+/// producer tasks, propagates their errors and panics, and aborts them on drop.
+///
+/// [`Result<O>`]: datafusion_common::Result
 /// [`ReceiverStream` from tokio-stream]: https://docs.rs/tokio-stream/latest/tokio_stream/wrappers/struct.ReceiverStream.html
-pub(crate) struct ReceiverStreamBuilder<O> {
+pub struct ReceiverStreamBuilder<O> {
     tx: Sender<Result<O>>,
     rx: Receiver<Result<O>>,
     join_set: JoinSet<Result<()>>,
 }
 
 impl<O: Send + 'static> ReceiverStreamBuilder<O> {
-    /// Create new channels with the specified buffer size
+    /// Creates a bounded channel with the specified capacity.
+    ///
+    /// Sending waits when the channel is full, providing backpressure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero.
     pub fn new(capacity: usize) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
 
@@ -72,13 +93,19 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         }
     }
 
-    /// Get a handle for sending data to the output
+    /// Returns a sender for items and errors yielded by the stream.
+    ///
+    /// Dropping the builder or stream closes the receiver. Producers should
+    /// stop when sending returns an error. Retaining sender handles keeps the
+    /// channel open, preventing normal stream completion.
     pub fn tx(&self) -> Sender<Result<O>> {
         self.tx.clone()
     }
 
-    /// Spawn task that will be aborted if this builder (or the stream
-    /// built from it) are dropped
+    /// Spawns an asynchronous task tied to the builder and its stream.
+    ///
+    /// The task's returned error or panic is propagated when the stream is
+    /// polled. Dropping the builder or stream aborts the task.
     pub fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = Result<()>>,
@@ -87,7 +114,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         self.join_set.spawn(task);
     }
 
-    /// Same as [`Self::spawn`] but it spawns the task on the provided runtime
+    /// Like [`Self::spawn`], but spawns the task on the provided runtime.
     pub fn spawn_on<F>(&mut self, task: F, handle: &Handle)
     where
         F: Future<Output = Result<()>>,
@@ -96,11 +123,15 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         self.join_set.spawn_on(task, handle);
     }
 
-    /// Spawn a blocking task that will be aborted if this builder (or the stream
-    /// built from it) are dropped.
+    /// Spawns a blocking task tied to the builder and its stream.
     ///
-    /// This is often used to spawn tasks that write to the sender
-    /// retrieved from `Self::tx`.
+    /// The task's returned error or panic is propagated when the stream is
+    /// polled. Dropping the builder or stream requests cancellation, but a
+    /// blocking task that has already started cannot be forcibly stopped.
+    /// A queued task may be cancelled before it starts.
+    ///
+    /// Producers should exit when `blocking_send` on the sender returned by
+    /// [`Self::tx`] fails, or otherwise arrange cooperative cancellation.
     pub fn spawn_blocking<F>(&mut self, f: F)
     where
         F: FnOnce() -> Result<()>,
@@ -109,7 +140,9 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         self.join_set.spawn_blocking(f);
     }
 
-    /// Same as [`Self::spawn_blocking`] but it spawns the blocking task on the provided runtime
+    /// Like [`Self::spawn_blocking`], but uses the provided runtime.
+    ///
+    /// The same limitation on cancelling already-started blocking tasks applies.
     pub fn spawn_blocking_on<F>(&mut self, f: F, handle: &Handle)
     where
         F: FnOnce() -> Result<()>,
@@ -118,7 +151,15 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         self.join_set.spawn_blocking_on(f, handle);
     }
 
-    /// Create a stream of all data written to `tx`
+    /// Builds a stream merging channel items with tracked task failures.
+    ///
+    /// Drops the builder's own sender. On successful task completion, queued
+    /// items are drained before the stream ends, provided all other sender
+    /// handles are also dropped.
+    ///
+    /// The first observed task error is yielded and the other tracked tasks are
+    /// aborted. Channel items may still follow the error. Task panics instead
+    /// unwind the caller polling the stream.
     pub fn build(self) -> BoxStream<'static, Result<O>> {
         let Self {
             tx,
