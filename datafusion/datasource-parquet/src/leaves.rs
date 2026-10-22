@@ -2,7 +2,7 @@ use arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{ScalarValue, internal_err};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
+use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use log::{error, trace, warn};
@@ -225,7 +225,8 @@ pub fn projection_specifier(
                     // }
                     // let pieces = v.split(".").collect::<Vec<_>>();
                 })
-                .filter_map(Result::ok)
+                // An empty path retains the full column when conversion fails.
+                .map(Result::unwrap_or_default)
                 .collect::<Vec<String>>();
             // trace!(target: "deep", "newv = {:?}", &newv)
             newv.sort_by_key(|s| (s.split('.').count(), s.len()));
@@ -254,101 +255,12 @@ pub fn projection_specifier(
     final_map
 }
 
-/// returns true if the expr is a combination of get_field, array_elements, CAST, or column reference
-pub fn expr_is_only_get_field_or_array_or_cast_and_contains_column(
-    input: &Arc<dyn PhysicalExpr>,
-) -> bool {
-    let mut has_invalid_expr_type = false;
-    let mut has_column = false;
-    let _ = input.apply(|pe| {
-        if let Some(sfe) = pe.downcast_ref::<ScalarFunctionExpr>()
-            && sfe.name() == "get_field"
-        {
-            return Ok(TreeNodeRecursion::Continue);
-        };
-        if let Some(sfe) = pe.downcast_ref::<ScalarFunctionExpr>()
-            && sfe.name() == "array_element"
-        {
-            return Ok(TreeNodeRecursion::Continue);
-        };
-        if let Some(_) = pe.downcast_ref::<CastExpr>() {
-            return Ok(TreeNodeRecursion::Continue);
-        };
-        if let Some(_) = pe.downcast_ref::<Column>() {
-            has_column = true;
-            return Ok(TreeNodeRecursion::Stop);
-        };
-        has_invalid_expr_type = true;
-        return Ok(TreeNodeRecursion::Stop);
-    });
-    !has_invalid_expr_type && has_column
-}
-
-pub fn extract_expressions_for_deep_projection(input: &Arc<dyn PhysicalExpr>) -> Vec<Arc<dyn PhysicalExpr>> {
-    let mut out: Vec<Arc<dyn PhysicalExpr>> = vec![];
-    let _ = input.apply(|pe| {
-        if expr_is_only_get_field_or_array_or_cast_and_contains_column(pe) {
-            out.push(pe.clone());
-            return Ok(TreeNodeRecursion::Jump);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    out
-}
-
-/// returns true if the expr is a combination of get_field, array_elements, CAST, or column reference
-pub fn expr_has_get_field_or_array_element(
-    input: &Arc<dyn PhysicalExpr>,
-) -> bool {
-    let mut has_invalid_expr_type = false;
-    let _ = input.apply(|pe| {
-        if let Some(sfe) = pe.downcast_ref::<ScalarFunctionExpr>()
-            && sfe.name() == "get_field"
-        {
-            has_invalid_expr_type = true;
-            return Ok(TreeNodeRecursion::Stop);
-        };
-        if let Some(sfe) = pe.downcast_ref::<ScalarFunctionExpr>()
-            && sfe.name() == "array_element"
-        {
-            has_invalid_expr_type = true;
-            return Ok(TreeNodeRecursion::Stop);
-        };
-        return Ok(TreeNodeRecursion::Continue);
-    });
-    has_invalid_expr_type
-}
-
-
-/// extracts a list of expression that contain a small set of operations from a larger column
-/// This drills down in expressions until it reaches branches of the tree that only contain get_field, array_element, CAST, or column
-/// linearizes that and return them
-pub fn get_expressions_amenable_to_deep_projection(
-    input: &Arc<dyn PhysicalExpr>,
-) -> Vec<Arc<dyn PhysicalExpr>> {
-    let mut out = vec![];
-    let _ = input.apply(|pe| {
-        if expr_is_only_get_field_or_array_or_cast_and_contains_column(pe) {
-            out.push(pe.clone());
-            return Ok(TreeNodeRecursion::Jump);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    out
-}
-
-/// finds a column inside a larger expression that may contain columns
-pub fn get_first_column_from_expr(expr: &Arc<dyn PhysicalExpr>) -> Option<Column> {
-    let mut out: Option<Column> = None;
-    let _ = expr.apply(|expr| {
-        if let Some(column) = expr.downcast_ref::<Column>() {
-            out = Some(column.clone());
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    out
-}
+pub use datafusion_physical_optimizer::projection_hints::{
+    expr_has_get_field_or_array_element,
+    expr_is_only_get_field_or_array_or_cast_and_contains_column,
+    extract_expressions_for_deep_projection,
+    get_expressions_amenable_to_deep_projection, get_first_column_from_expr,
+};
 
 pub fn simplified_parquet_column_path(expr: &Arc<dyn PhysicalExpr>) -> String {
     let mut accum: VecDeque<String> = VecDeque::new();
