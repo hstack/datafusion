@@ -77,6 +77,7 @@ use parquet::file::metadata::ParquetMetaData;
 
 use datafusion_common::Result;
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::deep::cast_record_batch;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
@@ -111,6 +112,9 @@ pub(crate) struct DatafusionArrowPredicate {
     /// Path to the leaf columns in the parquet schema required to evaluate the
     /// expression
     projection_mask: ProjectionMask,
+    /// Schema expected by `physical_expr`. This can contain empty struct columns
+    /// that are not present in the batch produced by an empty Parquet projection.
+    projected_schema: SchemaRef,
     /// how many rows were filtered out by this predicate
     rows_pruned: metrics::Count,
     /// how many rows passed this predicate
@@ -127,12 +131,13 @@ impl DatafusionArrowPredicate {
         rows_matched: metrics::Count,
         time: metrics::Time,
     ) -> Result<Self> {
-        let physical_expr =
-            reassign_expr_columns(candidate.expr, &candidate.read_plan.projected_schema)?;
+        let projected_schema = Arc::clone(&candidate.read_plan.projected_schema);
+        let physical_expr = reassign_expr_columns(candidate.expr, &projected_schema)?;
 
         Ok(Self {
             physical_expr,
             projection_mask: candidate.read_plan.projection_mask,
+            projected_schema,
             rows_pruned,
             rows_matched,
             time,
@@ -148,6 +153,20 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
         // scoped timer updates on drop
         let mut timer = self.time.timer();
+
+        let batch = if batch.schema() != self.projected_schema
+            && !batch.schema().fields().is_empty()
+            && !self.projected_schema.fields().is_empty()
+        {
+            cast_record_batch(&batch, Arc::clone(&self.projected_schema), false, true)
+                .map_err(|e| {
+                    ArrowError::ComputeError(format!(
+                        "Error adapting filter predicate batch: {e:?}"
+                    ))
+                })?
+        } else {
+            batch
+        };
 
         self.physical_expr
             .evaluate(&batch)
@@ -1068,6 +1087,69 @@ mod test {
         let expr = logical2physical(&expr, &table_schema);
 
         assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
+    }
+
+    #[test]
+    fn get_field_on_cast_struct_allows_pushdown() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(vec![Field::new("value", DataType::Int32, true)].into()),
+            true,
+        )]));
+        let cast_type =
+            DataType::Struct(vec![Field::new("value", DataType::Int64, true)].into());
+        let expr = get_field()
+            .call(vec![
+                Expr::Cast(datafusion_expr::expr::Cast::new(
+                    Box::new(col("s")),
+                    cast_type,
+                )),
+                Expr::Literal(ScalarValue::Utf8(Some("value".to_string())), None),
+            ])
+            .gt(Expr::Literal(ScalarValue::Int64(Some(5)), None));
+        let expr = logical2physical(&expr, &schema);
+
+        assert!(can_expr_be_pushed_down_with_schemas(&expr, &schema));
+    }
+
+    #[test]
+    fn predicate_adapts_batch_to_projected_schema() {
+        let projected_schema = Arc::new(Schema::new(vec![Field::new(
+            "keep",
+            DataType::Boolean,
+            false,
+        )]));
+        let candidate = FilterCandidate {
+            expr: Arc::new(Column::new("keep", 0)),
+            required_bytes: 0,
+            read_plan: ParquetReadPlan {
+                projection_mask: ProjectionMask::all(),
+                projected_schema,
+            },
+        };
+        let mut predicate = DatafusionArrowPredicate::try_new(
+            candidate,
+            Count::new(),
+            Count::new(),
+            Time::new(),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("unused", DataType::Boolean, false),
+                Field::new("keep", DataType::Boolean, false),
+            ])),
+            vec![
+                Arc::new(BooleanArray::from(vec![false, true])),
+                Arc::new(BooleanArray::from(vec![true, false])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            predicate.evaluate(batch).unwrap(),
+            BooleanArray::from(vec![true, false])
+        );
     }
 
     /// get_field on a struct field that resolves to a nested type should still block pushdown.
