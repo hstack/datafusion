@@ -155,6 +155,20 @@ fn roundtrip_parquet_exec_with_projection_hints() -> Result<()> {
 }
 
 #[test]
+fn roundtrip_parquet_exec_without_registered_object_store() -> Result<()> {
+    let file_schema =
+        Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
+    let file_source = Arc::new(ParquetSource::new(file_schema));
+    let scan_config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::parse("test://unregistered")?,
+        file_source,
+    )
+    .build();
+
+    roundtrip_test(DataSourceExec::from_data_source(scan_config))
+}
+
+#[test]
 fn roundtrip_parquet_exec_attaches_cached_reader_factory_after_roundtrip() -> Result<()> {
     let file_schema =
         Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
