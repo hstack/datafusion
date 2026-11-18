@@ -61,6 +61,7 @@ pub mod rounding;
 pub mod scalar;
 pub mod spans;
 pub mod stats;
+pub mod substrait_tree;
 pub mod test_util;
 pub mod tree_node;
 pub mod types;
