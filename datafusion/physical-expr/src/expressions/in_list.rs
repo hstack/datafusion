@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::PhysicalExpr;
+use crate::expressions::Column;
 use crate::physical_expr::physical_exprs_bag_equal;
 
 use arrow::array::*;
@@ -31,6 +32,7 @@ use arrow::compute::kernels::boolean::{not, or_kleene};
 use arrow::compute::kernels::cmp::eq as arrow_eq;
 use arrow::datatypes::*;
 
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
     DFSchema, Result, ScalarValue, assert_or_internal_err, exec_err,
 };
@@ -233,8 +235,27 @@ impl InListExpr {
         negated: bool,
         schema: &Schema,
     ) -> Result<Self> {
+        // @HStack - temporary fix
+        // possibly rewrite the column indices !!!
+        let new_expr = Arc::clone(&expr)
+            .transform(|e| {
+                if let Some(column) = e.downcast_ref::<Column>() {
+                    let column_name = column.name();
+                    return if let Ok(new_index) = schema.index_of(column_name) {
+                        Ok(Transformed::yes(
+                            Arc::new(Column::new(column_name, new_index))
+                                as Arc<dyn PhysicalExpr>,
+                        ))
+                    } else {
+                        Ok(Transformed::no(e))
+                    };
+                }
+                Ok(Transformed::no(e))
+            })
+            .data()?;
+
         // Check the data types match
-        let expr_data_type = expr.data_type(schema)?;
+        let expr_data_type = new_expr.data_type(schema)?;
         for list_expr in list.iter() {
             let list_expr_data_type = list_expr.data_type(schema)?;
             assert_inlist_data_types_match(&expr_data_type, &list_expr_data_type)?;
@@ -532,6 +553,18 @@ mod tests {
     use itertools::Itertools;
 
     type InListCastResult = (Arc<dyn PhysicalExpr>, Vec<Arc<dyn PhysicalExpr>>);
+
+    #[test]
+    fn in_list_with_column_index_from_unprojected_schema() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("value", DataType::Utf8, false)]);
+        InListExpr::try_new(
+            Arc::new(Column::new("value", 1)),
+            vec![lit("x")],
+            false,
+            &schema,
+        )?;
+        Ok(())
+    }
 
     // Try to do the type coercion for list physical expr.
     // It's just used in the test

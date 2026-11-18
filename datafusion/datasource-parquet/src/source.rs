@@ -1185,6 +1185,32 @@ impl ParquetSource {
                 .map(|&i| schema.field(i as usize).clone())
                 .collect();
             Arc::new(Schema::new(projected_fields))
+        } else if let Some(proto_projection_exprs) = &base_conf.projection_exprs {
+            let projection_exprs: Vec<ProjectionExpr> = proto_projection_exprs
+                .projections
+                .iter()
+                .map(|proto_expr| {
+                    let expr = ctx.decode_expr(
+                        proto_expr.expr.as_ref().ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "ProjectionExpr missing expr field"
+                            )
+                        })?,
+                        &schema,
+                    )?;
+                    Ok(ProjectionExpr::new(expr, proto_expr.alias.clone()))
+                })
+                .collect::<datafusion_common::Result<Vec<_>>>()?;
+
+            let projection_exprs = ProjectionExprs::new(projection_exprs);
+            let projected_fields = projection_exprs
+                .column_indices()
+                .iter()
+                .map(|&i| schema.field(i).clone())
+                .collect::<Vec<_>>();
+            let _predicate_schema = Arc::new(Schema::new(projected_fields));
+            // @HStack DISABLED for now - if we want to actually have a projection,
+            Arc::clone(&schema)
         } else {
             Arc::clone(&schema)
         };
