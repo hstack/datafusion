@@ -42,6 +42,10 @@ set datafusion.execution.target_partitions = 4;
 statement ok
 set datafusion.optimizer.repartition_aggregations = true;
 
+# Keep one scan partition per file without bin-packing changing EXPLAIN order.
+statement ok
+set datafusion.optimizer.repartition_file_scans = false;
+
 # Create partition 1
 statement ok
 COPY (SELECT column1 as channel, column2 as brand, column3 as amount FROM (VALUES
@@ -244,3 +248,6 @@ web nike 700
 
 statement ok
 DROP TABLE sales;
+
+statement ok
+reset datafusion.optimizer.repartition_file_scans;
