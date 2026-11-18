@@ -107,6 +107,54 @@ fn roundtrip_parquet_exec_with_pruning_predicate() -> Result<()> {
 }
 
 #[test]
+fn roundtrip_parquet_exec_with_projection_hints() -> Result<()> {
+    use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+
+    let file_schema = Arc::new(Schema::new(vec![
+        Field::new("unused", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]));
+    let projection_hints = ProjectionExprs::new(vec![ProjectionExpr::new(
+        col("value", &file_schema)?,
+        "hint",
+    )]);
+    let mut source = ParquetSource::new(Arc::clone(&file_schema));
+    source.projection_hints = projection_hints.clone();
+    source.projection_hints_indices = vec![0];
+
+    let scan_config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
+            .with_projection_indices(Some(vec![1]))?
+            .build();
+    let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(scan_config);
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DefaultPhysicalProtoConverter {};
+    let decoded =
+        roundtrip_test_and_return(Arc::clone(&plan), &ctx, &codec, &proto_converter)?;
+    let mut roundtrips = vec![decoded];
+    #[cfg(feature = "json")]
+    {
+        let json = datafusion_proto::bytes::physical_plan_to_json(plan)?;
+        roundtrips.push(datafusion_proto::bytes::physical_plan_from_json(
+            &json,
+            ctx.task_ctx().as_ref(),
+        )?);
+    }
+
+    for decoded in roundtrips.drain(..) {
+        let (_, source) = decoded
+            .downcast_ref::<DataSourceExec>()
+            .expect("expected DataSourceExec")
+            .downcast_to_file_source::<ParquetSource>()
+            .expect("expected ParquetSource");
+        assert_eq!(source.projection_hints, projection_hints);
+        assert_eq!(source.projection_hints_indices, vec![0]);
+    }
+    Ok(())
+}
+
+#[test]
 fn roundtrip_parquet_exec_attaches_cached_reader_factory_after_roundtrip() -> Result<()> {
     let file_schema =
         Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));

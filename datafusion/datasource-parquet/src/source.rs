@@ -1097,10 +1097,30 @@ impl FileSource for ParquetSource {
             .map(|pred| ctx.encode_expr(&pred))
             .transpose()?;
 
+        let projection_hints = protobuf::ProjectionExprs {
+            projections: self
+                .projection_hints
+                .iter()
+                .map(|expr| {
+                    Ok(protobuf::ProjectionExpr {
+                        alias: expr.alias.to_string(),
+                        expr: Some(ctx.encode_expr(&expr.expr)?),
+                    })
+                })
+                .collect::<datafusion_common::Result<Vec<_>>>()?,
+        };
+        let projection_hints_indices = self
+            .projection_hints_indices
+            .iter()
+            .map(|index| *index as u64)
+            .collect();
+
         let node = protobuf::ParquetScanExecNode {
             base_conf: Some(base.try_to_proto(ctx)?),
             predicate,
             parquet_options: Some(self.table_parquet_options().try_into()?),
+            projection_hints: Some(projection_hints),
+            projection_hints_indices,
         };
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::ParquetScan(node)),
@@ -1123,6 +1143,7 @@ impl ParquetSource {
         use datafusion_datasource::file_scan_config::FileScanConfig;
         use datafusion_datasource::source::DataSourceExec;
         use datafusion_execution::object_store::ObjectStoreUrl;
+        use datafusion_physical_expr::projection::ProjectionExpr;
         use datafusion_proto_models::protobuf;
 
         let scan = match &node.physical_plan_type {
@@ -1165,7 +1186,7 @@ impl ParquetSource {
                 .collect();
             Arc::new(Schema::new(projected_fields))
         } else {
-            schema
+            Arc::clone(&schema)
         };
 
         let predicate = scan
@@ -1202,6 +1223,29 @@ impl ParquetSource {
 
         if let Some(predicate) = predicate {
             source = source.with_predicate(predicate);
+        }
+        if let Some(proto_projection_hints) = &scan.projection_hints {
+            let projection_hints = proto_projection_hints
+                .projections
+                .iter()
+                .map(|proto_expr| {
+                    let expr = ctx.decode_expr(
+                        proto_expr.expr.as_ref().ok_or_else(|| {
+                            datafusion_common::internal_datafusion_err!(
+                                "ProjectionExpr missing expr field"
+                            )
+                        })?,
+                        &schema,
+                    )?;
+                    Ok(ProjectionExpr::new(expr, proto_expr.alias.clone()))
+                })
+                .collect::<datafusion_common::Result<Vec<_>>>()?;
+            source.projection_hints = ProjectionExprs::new(projection_hints);
+            source.projection_hints_indices = scan
+                .projection_hints_indices
+                .iter()
+                .map(|index| *index as usize)
+                .collect();
         }
         let base_config =
             FileScanConfig::try_from_proto(base_conf, ctx, Arc::new(source))?;
