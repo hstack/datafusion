@@ -239,6 +239,8 @@ pub(super) struct ParquetMorselizer {
     pub(crate) partition_index: usize,
     /// Projection to apply on top of the table schema (i.e. can reference partition columns).
     pub projection: ProjectionExprs,
+    pub projection_hints: Option<ProjectionExprs>,
+    pub projection_hints_indices: Vec<usize>,
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
@@ -438,6 +440,8 @@ struct PreparedParquetOpen {
     physical_file_schema: SchemaRef,
     output_schema: SchemaRef,
     projection: ProjectionExprs,
+    projection_hints: Option<ProjectionExprs>,
+    projection_hints_indices: Vec<usize>,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Per-scan virtual-column state, Arc-cloned from [`ParquetMorselizer`] so
     /// each file shares validated fields, precomputed null replacements, and
@@ -839,6 +843,8 @@ impl ParquetMorselizer {
             physical_file_schema: logical_file_schema,
             output_schema,
             projection,
+            projection_hints: self.projection_hints.clone(),
+            projection_hints_indices: self.projection_hints_indices.clone(),
             predicate,
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
@@ -1429,6 +1435,9 @@ impl RowGroupsPrunedParquetOpen {
         // wiring.
         let decoder_projection = DecoderProjection::try_new(
             &prepared.projection,
+            &prepared.logical_file_schema,
+            prepared.projection_hints.as_ref(),
+            &prepared.projection_hints_indices,
             &prepared.physical_file_schema,
             reader_metadata.parquet_schema(),
             &prepared.output_schema,
@@ -2166,6 +2175,8 @@ mod test {
             Ok(ParquetMorselizer {
                 partition_index: self.partition_index,
                 projection,
+                projection_hints: None,
+                projection_hints_indices: vec![],
                 batch_size: self.batch_size,
                 limit: self.limit,
                 preserve_order: self.preserve_order,

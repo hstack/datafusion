@@ -45,6 +45,7 @@ datafusion-functions-aggregate-common = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-expr-adapter = { workspace = true }
 datafusion-physical-expr-common = { workspace = true }
+datafusion-physical-optimizer = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-proto-models = { workspace = true, optional = true }
 datafusion-pruning = { workspace = true }
